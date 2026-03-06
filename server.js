@@ -289,7 +289,19 @@ app.post('/api/place-bet', async (req, res) => {
         res.status(500).json({ success: false, message: 'Bet placement failed' });
     }
 });
-
+// ==========================================
+// GET USER BETS ENDPOINT
+// ==========================================
+app.get('/api/bets/:phone', async (req, res) => {
+    try {
+        // Find all bets for this phone number, newest first
+        const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
+        res.json({ success: true, bets });
+    } catch (error) {
+        console.error("Fetch Bets Error:", error);
+        res.status(500).json({ success: false, message: 'Failed to fetch betting history' });
+    }
+});
 // ==========================================
 // START SERVER
 // ==========================================
