@@ -159,7 +159,8 @@ app.post('/api/register', async (req, res) => {
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, phone: newUser.phone } });
     } catch (error) {
         console.error("Registration Error: ", error);
-        res.status(500).json({ success: false, message: 'Server error during registration' });
+        // This will send the EXACT MongoDB/Server error to your frontend popup!
+        res.status(500).json({ success: false, message: 'Server crash details: ' + error.message });
     }
 });
 
