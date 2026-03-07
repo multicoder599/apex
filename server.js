@@ -4,7 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const mongoose = require('mongoose');
 const axios = require('axios');
-const bcrypt = require('bcryptjs'); // NEW: Added for secure password hashing
+const bcrypt = require('bcryptjs'); 
 
 const app = express();
 
@@ -17,8 +17,6 @@ const allowedOrigins = [
     /https:\/\/.*\.surge\.sh$/ // Securely allows any surge.sh subdomain
 ];
 
-// In development, sometimes it's easier to just allow all origins. 
-// If you face CORS issues testing locally, you can temporarily change this to cors()
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin || allowedOrigins.some(domain => 
@@ -79,6 +77,21 @@ const transactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
+// --- 4. Live Game Model (For Admin Injection) ---
+// strict: false allows us to dynamically inject any JSON shape Gemini provides
+const liveGameSchema = new mongoose.Schema({
+    id: Number,
+    category: String,
+    home: String,
+    away: String,
+    odds: String,
+    draw: String,
+    away_odds: String,
+    time: String,
+    status: { type: String, default: 'upcoming' }
+}, { strict: false }); 
+const LiveGame = mongoose.model('LiveGame', liveGameSchema);
+
 
 // ==========================================
 // SECURE ODDS API PROXY
@@ -122,31 +135,26 @@ app.post('/api/register', async (req, res) => {
     try {
         const { phone, password, name } = req.body;
         
-        // 1. Basic validation
         if (!phone || !password) {
             return res.status(400).json({ success: false, message: 'Phone and password are required.' });
         }
 
-        // 2. Check if user already exists
         const existingUser = await User.findOne({ phone });
         if (existingUser) {
             return res.status(400).json({ success: false, message: 'Phone number already registered. Please login.' });
         }
 
-        // 3. Hash the password securely
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        // 4. Create new user with hashed password
         const newUser = new User({ 
             phone, 
             password: hashedPassword, 
             name: name || 'New Player', 
-            balance: 100 // 100 KES Welcome Bonus
+            balance: 100 
         });
         await newUser.save();
 
-        // 5. Log the welcome bonus as a transaction
         await Transaction.create({
             refId: 'BONUS-' + Math.floor(Math.random() * 900000),
             userPhone: phone,
@@ -155,11 +163,9 @@ app.post('/api/register', async (req, res) => {
             amount: 100
         });
 
-        // 6. Return success (DO NOT send the password back to the client)
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, phone: newUser.phone } });
     } catch (error) {
         console.error("Registration Error: ", error);
-        // This will send the EXACT MongoDB/Server error to your frontend popup!
         res.status(500).json({ success: false, message: 'Server crash details: ' + error.message });
     }
 });
@@ -169,17 +175,13 @@ app.post('/api/login', async (req, res) => {
     try {
         const { phone, password } = req.body;
 
-        // 1. Find user by phone number
         const user = await User.findOne({ phone });
         if (!user) {
             return res.status(401).json({ success: false, message: 'Invalid phone number or password' });
         }
 
-        // 2. Compare the provided password with the hashed password in the DB
         const isMatch = await bcrypt.compare(password, user.password);
         
-        // 3. Handle older un-hashed passwords (useful if you registered users before adding bcrypt)
-        // If bcrypt fails, check if it matches the plain text. If it does, hash it and save it for future use.
         if (!isMatch) {
             if (password === user.password) {
                 const salt = await bcrypt.genSalt(10);
@@ -190,7 +192,6 @@ app.post('/api/login', async (req, res) => {
             }
         }
 
-        // 4. Successful login
         res.json({ success: true, user: { name: user.name, balance: user.balance, phone: user.phone } });
         
     } catch (error) {
@@ -289,12 +290,9 @@ app.post('/api/place-bet', async (req, res) => {
         res.status(500).json({ success: false, message: 'Bet placement failed' });
     }
 });
-// ==========================================
-// GET USER BETS ENDPOINT
-// ==========================================
+
 app.get('/api/bets/:phone', async (req, res) => {
     try {
-        // Find all bets for this phone number, newest first
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         res.json({ success: true, bets });
     } catch (error) {
@@ -302,6 +300,56 @@ app.get('/api/bets/:phone', async (req, res) => {
         res.status(500).json({ success: false, message: 'Failed to fetch betting history' });
     }
 });
+
+
+// ==========================================
+// ADMIN LIVE GAMES INJECTOR ENDPOINTS
+// ==========================================
+
+// 1. GET: Frontend fetches injected games from here
+app.get('/api/games', async (req, res) => {
+    try {
+        const games = await LiveGame.find({});
+        res.json({ success: true, games });
+    } catch (error) {
+        console.error("Fetch Games Error:", error);
+        res.status(500).json({ success: false, message: 'Failed to fetch games' });
+    }
+});
+
+// 2. POST: Admin panel sends new games here
+app.post('/api/games', async (req, res) => {
+    try {
+        const { games, mode } = req.body;
+        
+        if (!games || !Array.isArray(games)) {
+            return res.status(400).json({ success: false, message: 'Invalid data format. Must be an array.' });
+        }
+
+        if (mode === 'replace') {
+            await LiveGame.deleteMany({}); // Wipe DB clean
+        }
+        
+        await LiveGame.insertMany(games); // Save new games to MongoDB
+        
+        const totalCount = await LiveGame.countDocuments();
+        res.json({ success: true, message: "Games updated in database", count: totalCount });
+    } catch (error) {
+        console.error("Inject Games Error:", error);
+        res.status(500).json({ success: false, message: 'Failed to inject games' });
+    }
+});
+
+// 3. DELETE: Admin panel clears all games
+app.delete('/api/games', async (req, res) => {
+    try {
+        await LiveGame.deleteMany({});
+        res.json({ success: true, message: "Global database cleared" });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to clear database' });
+    }
+});
+
 // ==========================================
 // START SERVER
 // ==========================================
