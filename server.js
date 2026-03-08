@@ -5,24 +5,19 @@ const path = require('path');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const bcrypt = require('bcryptjs'); 
-const http = require('http'); 
-const { Server } = require('socket.io'); 
+const http = require('http');
 
 const app = express();
 const server = http.createServer(app); 
 
 // ==========================================
-// CORS & SOCKET CONFIGURATION
+// CORS CONFIGURATION (No more socket.io)
 // ==========================================
 app.use(cors({
-    origin: "*", // 🟢 ALLOWS ALL CONNECTIONS
+    origin: "*", 
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: false 
 }));
-
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -36,54 +31,10 @@ const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
 
 // ==========================================
-// REAL-TIME SOCKET HANDLER
-// ==========================================
-const activeSockets = {}; 
-
-io.on('connection', (socket) => {
-    // 🟢 FIX: Normalize phone number so admin notifications always reach the user
-    socket.on('register_user', (phone) => {
-        if(phone) {
-            let formattedPhone = phone.replace(/\D/g, '');
-            if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
-            if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
-            
-            // Store both raw and formatted to ensure delivery
-            activeSockets[formattedPhone] = socket.id;
-            activeSockets[phone] = socket.id; 
-            console.log(`User ${formattedPhone} connected to socket`);
-        }
-    });
-
-    socket.on('join_chat', (chatId) => {
-        socket.join(chatId);
-        console.log(`User joined chat room: ${chatId}`);
-    });
-
-    socket.on('disconnect', () => {
-        for (let phone in activeSockets) {
-            if (activeSockets[phone] === socket.id) delete activeSockets[phone];
-        }
-    });
-});
-
-function sendPushNotification(phone, title, message, type) {
-    let formattedPhone = phone.replace(/\D/g, '');
-    if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
-    if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
-
-    const socketId = activeSockets[formattedPhone] || activeSockets[phone];
-    if (socketId) {
-        io.to(socketId).emit('new_notification', { title, message, type, time: Date.now() });
-    }
-}
-
-// ==========================================
 // TELEGRAM BOT UTILITY
 // ==========================================
 function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
     axios.post(url, { chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
         .catch(err => console.error("Telegram Notification Error:", err.message));
@@ -101,7 +52,7 @@ const userSchema = new mongoose.Schema({
     password: { type: String, required: true }, 
     name: { type: String, required: true },
     balance: { type: Number, default: 0 },
-    bonusBalance: { type: Number, default: 0 }, 
+    bonusBalance: { type: Number, default: 0 },
     referredBy: { type: String, default: null }, 
     createdAt: { type: Date, default: Date.now }
 });
@@ -137,6 +88,49 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
+// 🟢 NEW: NOTIFICATION MODEL FOR HTTP POLLING
+const notificationSchema = new mongoose.Schema({
+    userPhone: { type: String, required: true },
+    title: { type: String, required: true },
+    message: { type: String, required: true },
+    type: { type: String },
+    isRead: { type: Boolean, default: false },
+    createdAt: { type: Date, default: Date.now }
+});
+const Notification = mongoose.model('Notification', notificationSchema);
+
+// 🟢 Helper function to save notifications to DB instead of Socket.io
+async function sendPushNotification(phone, title, message, type) {
+    try {
+        let formattedPhone = phone.replace(/\D/g, '');
+        if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
+        if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
+
+        await Notification.create({ userPhone: formattedPhone, title, message, type });
+        
+        // Save for the unformatted version too just in case
+        if(phone !== formattedPhone) {
+            await Notification.create({ userPhone: phone, title, message, type });
+        }
+    } catch(e) { console.error("Notification Save Error", e); }
+}
+
+// 🟢 NEW ENDPOINT: Frontend checks this every 5 seconds
+app.get('/api/notifications/:phone', async (req, res) => {
+    try {
+        const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
+        
+        // Mark them as read instantly so they don't trigger twice
+        if (notifs.length > 0) {
+            await Notification.updateMany({ userPhone: req.params.phone, isRead: false }, { $set: { isRead: true } });
+        }
+        
+        res.json({ success: true, notifications: notifs });
+    } catch (e) {
+        res.status(500).json({ success: false });
+    }
+});
+
 
 // ==========================================
 // AUTHENTICATION & REFERRAL ENDPOINTS
@@ -162,22 +156,12 @@ app.post('/api/register', async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        const newUser = new User({ 
-            phone, 
-            password: hashedPassword, 
-            name: name || 'New Player', 
-            balance: 0, 
-            bonusBalance: 0,
-            referredBy: referredByPhone 
-        });
+        const newUser = new User({ phone, password: hashedPassword, name: name || 'New Player', balance: 0, bonusBalance: 0, referredBy: referredByPhone });
         await newUser.save();
 
         sendTelegramMessage(`🚨 <b>NEW USER REGISTRATION</b> 🚨\n\n👤 <b>Name:</b> ${newUser.name}\n📱 <b>Phone:</b> ${newUser.phone}\n🔗 <b>Referred By:</b> ${referredByPhone || 'None'}`);
-        
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -187,7 +171,6 @@ app.post('/api/login', async (req, res) => {
         if (!user) return res.status(401).json({ success: false, message: 'Invalid phone number or password' });
 
         const isMatch = await bcrypt.compare(password, user.password);
-        
         if (!isMatch) {
             if (password === user.password) {
                 const salt = await bcrypt.genSalt(10);
@@ -198,9 +181,7 @@ app.post('/api/login', async (req, res) => {
             }
         }
         res.json({ success: true, user: { name: user.name, balance: user.balance, bonusBalance: user.bonusBalance || 0, phone: user.phone } });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
 
 // ==========================================
@@ -232,15 +213,10 @@ app.post('/api/deposit', async (req, res) => {
         };
 
         await axios.post('https://megapay.co.ke/backend/v1/initiatestk', payload);
-
-        await Transaction.create({ 
-            refId: reference, userPhone: user.phone, type: 'deposit', method: method || 'M-Pesa', amount: Number(amount), status: 'Pending' 
-        });
+        await Transaction.create({ refId: reference, userPhone: user.phone, type: 'deposit', method: method || 'M-Pesa', amount: Number(amount), status: 'Pending' });
 
         res.status(200).json({ success: true, message: "STK Push Sent! Check your phone.", newBalance: user.balance, refId: reference });
-    } catch (error) { 
-        res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); 
-    }
+    } catch (error) { res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); }
 });
 
 app.post('/api/megapay/webhook', async (req, res) => {
@@ -265,9 +241,7 @@ app.post('/api/megapay/webhook', async (req, res) => {
         user.balance += amount;
         await user.save();
 
-        await Transaction.create({
-            refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success"
-        });
+        await Transaction.create({ refId: receipt, userPhone: user.phone, type: "deposit", method: "M-Pesa", amount: amount, status: "Success" });
 
         sendPushNotification(user.phone, "Deposit Successful", `Your deposit of KES ${amount} has been credited.`, "deposit");
         sendTelegramMessage(`✅ <b>DEPOSIT CONFIRMED</b> ✅\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Receipt:</b> ${receipt}`);
@@ -278,22 +252,11 @@ app.post('/api/megapay/webhook', async (req, res) => {
                 referrer.bonusBalance = (referrer.bonusBalance || 0) + 50;
                 await referrer.save();
 
-                await Transaction.create({
-                    refId: `REF-BONUS-${receipt}`,
-                    userPhone: referrer.phone,
-                    type: "bonus",
-                    method: "Referral Deposit Bonus",
-                    amount: 50,
-                    status: "Success"
-                });
-
+                await Transaction.create({ refId: `REF-BONUS-${receipt}`, userPhone: referrer.phone, type: "bonus", method: "Referral Deposit Bonus", amount: 50, status: "Success" });
                 sendPushNotification(referrer.phone, "Referral Bonus! 🎁", `Your friend made a deposit! KES 50 has been added to your Bonus Wallet.`, "bonus");
             }
         }
-
-    } catch (err) { 
-        console.error("Webhook Processing Error:", err); 
-    }
+    } catch (err) { console.error("Webhook Processing Error:", err); }
 });
 
 app.post('/api/withdraw', async (req, res) => {
@@ -303,7 +266,7 @@ app.post('/api/withdraw', async (req, res) => {
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         
         if (user.balance < amount) {
-            return res.status(400).json({ success: false, message: 'Insufficient withdrawable funds. (Bonus funds cannot be withdrawn directly).' });
+            return res.status(400).json({ success: false, message: 'Insufficient withdrawable funds.' });
         }
 
         user.balance -= Number(amount);
@@ -316,9 +279,7 @@ app.post('/api/withdraw', async (req, res) => {
         sendTelegramMessage(`💸 <b>WITHDRAWAL REQUEST</b> 💸\n\n👤 <b>User:</b> ${user.phone}\n💰 <b>Amount:</b> KES ${amount}\n🧾 <b>Ref:</b> ${refId}`);
 
         res.json({ success: true, newBalance: user.balance, refId });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Withdrawal processing failed' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Withdrawal processing failed' }); }
 });
 
 app.get('/api/balance/:phone', async (req, res) => {
@@ -326,18 +287,14 @@ app.get('/api/balance/:phone', async (req, res) => {
         const user = await User.findOne({ phone: req.params.phone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         res.json({ success: true, balance: user.balance, bonusBalance: user.bonusBalance || 0 });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Server error fetching balance' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Server error fetching balance' }); }
 });
 
 app.get('/api/transactions/:phone', async (req, res) => {
     try {
         const txns = await Transaction.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         res.json({ success: true, transactions: txns });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to fetch transactions' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to fetch transactions' }); }
 });
 
 // ==========================================
@@ -350,9 +307,7 @@ app.post('/api/place-bet', async (req, res) => {
 
         const totalAvailable = user.balance + (user.bonusBalance || 0);
 
-        if (!user || totalAvailable < stake) {
-            return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
-        }
+        if (!user || totalAvailable < stake) return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
 
         let remainingStake = stake;
         if (user.bonusBalance >= remainingStake) {
@@ -372,18 +327,14 @@ app.post('/api/place-bet', async (req, res) => {
         await Transaction.create({ refId: ticketId, userPhone, type: 'bet', method: `${betType || 'Sports'} Bet`, amount: -stake });
 
         res.json({ success: true, newBalance: user.balance, newBonus: user.bonusBalance, ticketId: newBet.ticketId });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Bet placement failed' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Bet placement failed' }); }
 });
 
 app.get('/api/bets/:phone', async (req, res) => {
     try {
         const bets = await Bet.find({ userPhone: req.params.phone }).sort({ createdAt: -1 });
         res.json({ success: true, bets });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to fetch betting history' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to fetch betting history' }); }
 });
 
 app.post('/api/cashout', async (req, res) => {
@@ -392,11 +343,10 @@ app.post('/api/cashout', async (req, res) => {
         
         const bet = await Bet.findOne({ ticketId: ticketId, userPhone: userPhone });
         if (!bet) return res.status(404).json({ success: false, message: 'Ticket not found.' });
-        if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled or cashed out.' });
+        if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled.' });
 
         const user = await User.findOne({ phone: userPhone });
-        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
+        
         bet.status = 'Cashed Out';
         await bet.save();
 
@@ -406,11 +356,8 @@ app.post('/api/cashout', async (req, res) => {
         await Transaction.create({ refId: `CO-${ticketId}`, userPhone, type: 'cashout', method: 'Cashout', amount: amount });
 
         sendPushNotification(user.phone, "Bet Cashed Out", `You successfully cashed out KES ${amount}.`, "cashout");
-
         res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
-    } catch (error) { 
-        res.status(500).json({ success: false, message: 'Server error processing cashout' }); 
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Server error processing cashout' }); }
 });
 
 // ==========================================
@@ -419,10 +366,8 @@ app.post('/api/cashout', async (req, res) => {
 setInterval(async () => {
     try {
         const openBets = await Bet.find({ status: 'Open' });
-        
         for (let bet of openBets) {
             if (Math.random() > 0.20) continue; 
-
             const isWin = Math.random() < 0.40;
             
             bet.status = isWin ? 'Won' : 'Lost';
@@ -439,9 +384,7 @@ setInterval(async () => {
                 }
             }
         }
-    } catch (error) { 
-        console.error("Settlement Error:", error.message); 
-    }
+    } catch (error) { console.error("Settlement Error:", error.message); }
 }, 60 * 60 * 1000); 
 
 // ==========================================
@@ -451,16 +394,12 @@ app.get('/api/admin/users', async (req, res) => {
     try {
         const users = await User.find({}).select('-password').sort({ createdAt: -1 });
         res.json({ success: true, users });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to fetch users' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to fetch users' }); }
 });
 
 app.put('/api/admin/users/balance', async (req, res) => {
     try {
         const { phone, newBalance } = req.body;
-        if (newBalance === undefined) return res.status(400).json({ success: false, message: 'New balance is required' });
-
         const user = await User.findOne({ phone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
@@ -469,11 +408,8 @@ app.put('/api/admin/users/balance', async (req, res) => {
         await user.save();
 
         await Transaction.create({ refId: 'ADMIN-' + Math.floor(Math.random() * 900000), userPhone: phone, type: 'bonus', method: 'Admin Adjustment', amount: user.balance - oldBalance, status: 'Success' });
-
         res.json({ success: true, message: `Balance updated to KES ${user.balance}.` });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to update user balance' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to update user balance' }); }
 });
 
 app.delete('/api/admin/users/:phone', async (req, res) => {
@@ -481,43 +417,29 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
         const user = await User.findOneAndDelete({ phone: req.params.phone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
         res.json({ success: true, message: `Account deleted.` });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to delete user account' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to delete user account' }); }
 });
 
 app.post('/api/admin/push-alert', (req, res) => {
     const { phone, title, message } = req.body;
-    if(phone === 'ALL') {
-        io.emit('new_notification', { title, message, type: 'admin_alert', time: Date.now() });
-    } else {
-        sendPushNotification(phone, title, message, 'admin_alert');
-    }
-    res.json({success: true, message: "Alert sent!"});
+    sendPushNotification(phone, title, message, 'admin_alert');
+    res.json({success: true, message: "Alert queued for user!"});
 });
 
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
-        if (!games || !Array.isArray(games)) return res.status(400).json({ success: false, message: 'Invalid data format. Must be an array.' });
-
         if (mode === 'replace') await LiveGame.deleteMany({}); 
         await LiveGame.insertMany(games); 
-        
-        const count = await LiveGame.countDocuments();
-        res.json({ success: true, message: "Games updated in database", count });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to inject games' });
-    }
+        res.json({ success: true, message: "Games updated in database" });
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to inject games' }); }
 });
 
 app.delete('/api/games', async (req, res) => {
     try {
         await LiveGame.deleteMany({});
         res.json({ success: true, message: "Global database cleared" });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to clear database' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to clear database' }); }
 });
 
 // ==========================================
@@ -531,9 +453,7 @@ app.get('/api/telegram/setup', async (req, res) => {
     try {
         const response = await axios.get(url);
         res.json({ message: "Webhook successfully linked!", data: response.data });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/support/chat-start', (req, res) => {
@@ -553,9 +473,7 @@ app.post('/api/chat/send', async (req, res) => {
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, { chat_id: TELEGRAM_CHAT_ID, text: tgMessage, parse_mode: 'HTML' });
         res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Telegram failed' });
-    }
+    } catch (e) { res.status(500).json({ success: false, message: 'Telegram failed' }); }
 });
 
 app.get('/api/chat/sync', (req, res) => {
@@ -563,6 +481,7 @@ app.get('/api/chat/sync', (req, res) => {
     res.json({ success: true, messages: activeChats[chatId] || [] });
 });
 
+// 🟢 Handles admin replying to the chat from Telegram
 app.post('/api/telegram/webhook', (req, res) => {
     res.sendStatus(200); 
     try {
@@ -570,14 +489,13 @@ app.post('/api/telegram/webhook', (req, res) => {
         if (!message || !message.reply_to_message || !message.text) return;
 
         const originalText = message.reply_to_message.text;
-        // 🟢 FIX: Secure Regex to ensure Telegram ID matches perfectly regardless of HTML formatting
         const match = originalText.match(/ID:\s*([a-zA-Z0-9_]+)/i);
         
         if (match && match[1]) {
             const chatId = match[1].trim();
             if (!activeChats[chatId]) activeChats[chatId] = [];
+            // This instantly saves the admin's reply into memory so the frontend poll will catch it.
             activeChats[chatId].push({ sender: 'admin', text: message.text });
-            io.to(chatId).emit('admin_reply', { sender: 'admin', text: message.text });
         }
     } catch(e) {}
 });
@@ -629,15 +547,11 @@ app.get('/api/games', async (req, res) => {
                             }
                         }
 
-                        // 🟢 FIX: Filter out completely unrealistic odds (e.g. 1000.00) or broken missing odds
                         const nH = parseFloat(h);
                         const nA = parseFloat(a);
                         if (nH < 1.05 || nA < 1.05 || nH > 50 || nA > 50) return null;
-                        
-                        // Drop soccer matches that don't have a draw market (usually Outrights/Tournament Winners)
                         if (m.sport_title.toLowerCase().includes('soccer') && !d) return null;
 
-                        // 🟢 FIX: Calculate true Live Status and Realistic Score based on API commence_time
                         const matchTime = new Date(m.commence_time);
                         const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
                         
@@ -647,7 +561,6 @@ app.get('/api/games', async (req, res) => {
                         const matchDateEAT = new Date(matchTime.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
                         const nowDateEAT = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
 
-                        // Drop games that have been finished for more than 2 hours
                         if (diffMins > 120) return null;
 
                         if (diffMins >= 0 && diffMins <= 115) {
@@ -655,7 +568,6 @@ app.get('/api/games', async (req, res) => {
                             timeStr = "Live";
                             min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString();
                             
-                            // Generate a mock realistic live score. The team with lower odds (favorite) is more likely to score.
                             const homeAdv = (1 / nH) > (1 / nA) ? 1.5 : 0.5;
                             hs = Math.floor((diffMins / 90) * homeAdv * Math.random() * 4);
                             as = Math.floor((diffMins / 90) * (2 - homeAdv) * Math.random() * 4);
@@ -676,16 +588,12 @@ app.get('/api/games', async (req, res) => {
                     }).filter(game => game !== null);
 
                     lastApiFetchTime = now;
-                } catch (apiErr) {
-                    console.error("Odds Fetch Error:", apiErr.message);
-                }
+                } catch (apiErr) { console.error("Odds Fetch Error"); }
             }
             allGames = [...allGames, ...cachedApiGames];
         }
         res.json({ success: true, games: allGames });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to aggregate games' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to aggregate games' }); }
 });
 
 // ==========================================
@@ -693,5 +601,5 @@ app.get('/api/games', async (req, res) => {
 // ==========================================
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-    console.log(`🚀 ApexBet Socket Server live on port ${PORT}`);
+    console.log(`🚀 ApexBet Server live on port ${PORT}`);
 });
