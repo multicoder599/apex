@@ -90,7 +90,6 @@ const Bet = mongoose.model('Bet', betSchema);
 const transactionSchema = new mongoose.Schema({
     refId: { type: String, required: true, unique: true }, 
     userPhone: { type: String, required: true },
-    // ADDED 'cashout' to the enum below so the DB accepts cashout transactions
     type: { type: String, enum: ['deposit', 'withdraw', 'bet', 'bonus', 'win', 'cashout'], required: true },
     method: { type: String, required: true },
     amount: { type: Number, required: true }, 
@@ -324,7 +323,7 @@ app.get('/api/bets/:phone', async (req, res) => {
     }
 });
 
-// NEW: CASHOUT ENDPOINT
+// CASHOUT ENDPOINT
 app.post('/api/cashout', async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
@@ -356,7 +355,6 @@ app.post('/api/cashout', async (req, res) => {
 // ==========================================
 // BACKGROUND BET SETTLEMENT SIMULATOR
 // ==========================================
-// This automatically runs every 60 minutes and settles games to generate history and winnings.
 setInterval(async () => {
     try {
         const openBets = await Bet.find({ status: 'Open' });
@@ -597,6 +595,86 @@ app.get('/api/games', async (req, res) => {
         res.status(500).json({ success: false, message: 'Failed to aggregate games' });
     }
 });
+
+
+// ==========================================
+// TELEGRAM LIVE CHAT BRIDGE (TWO-WAY)
+// ==========================================
+const activeChats = {}; // Stores chat history temporarily in memory
+
+// 1. Setup Webhook (Tells Telegram to send replies to this server)
+app.get('/api/telegram/setup', async (req, res) => {
+    const appUrl = process.env.APP_URL || 'https://apex-efwz.onrender.com';
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${appUrl}/api/telegram/webhook`;
+    try {
+        const response = await axios.get(url);
+        res.json({ message: "Webhook successfully linked!", data: response.data });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Chat Ping Event (Triggers when the modal is opened)
+app.post('/api/support/chat-start', (req, res) => {
+    const { phone } = req.body;
+    sendTelegramMessage(`💬 <b>LIVE CHAT OPENED</b> 💬\n\n👤 <b>User:</b> ${phone || 'Guest'}\n🕒 <b>Status:</b> Waiting for agent.`);
+    res.json({ success: true });
+});
+
+// 2. Receive message from Website -> Send to Telegram
+app.post('/api/chat/send', async (req, res) => {
+    const { chatId, text, phone } = req.body;
+    
+    if (!activeChats[chatId]) activeChats[chatId] = [];
+    activeChats[chatId].push({ sender: 'user', text });
+
+    // Format the message with the ID so we can parse it when you reply
+    const tgMessage = `💬 <b>New Message</b>\n👤 <b>User:</b> ${phone || 'Guest'}\n🔑 <b>ID:</b> ${chatId}\n\n${text}`;
+    
+    try {
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: tgMessage,
+            parse_mode: 'HTML'
+        });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Telegram failed' });
+    }
+});
+
+// 3. Website polls this endpoint to get Admin replies
+app.get('/api/chat/sync', (req, res) => {
+    const { chatId } = req.query;
+    const messages = activeChats[chatId] || [];
+    res.json({ success: true, messages });
+});
+
+// 4. Catch your replies from Telegram -> Route to Website
+app.post('/api/telegram/webhook', (req, res) => {
+    res.sendStatus(200); // Always acknowledge Telegram immediately
+    
+    try {
+        const message = req.body.message;
+        // Check if you are replying to a message
+        if (!message || !message.reply_to_message || !message.text) return;
+
+        // Find the Chat ID in the original message you replied to
+        const originalText = message.reply_to_message.text;
+        const match = originalText.match(/ID:\s*([^\n]+)/);
+        
+        if (match && match[1]) {
+            const chatId = match[1].trim();
+            if (!activeChats[chatId]) activeChats[chatId] = [];
+            
+            // Save your reply so the user's website can pull it
+            activeChats[chatId].push({ sender: 'admin', text: message.text });
+        }
+    } catch(e) {
+        console.error("Webhook processing error:", e);
+    }
+});
+
 
 // ==========================================
 // START SERVER
