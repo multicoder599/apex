@@ -100,43 +100,18 @@ const Notification = mongoose.model('Notification', notificationSchema);
 
 
 // ==========================================
-// 🟢 SERVER-SENT EVENTS (SSE) LOGIC
+// 🟢 NOTIFICATIONS (SMART POLLING ENDPOINT)
 // ==========================================
-const sseClients = new Map();
 
 app.get('/api/notifications/:phone', async (req, res) => {
     try {
         const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
         if (notifs.length > 0) {
+            // Instantly mark fetched notifications as read so they don't fire again
             await Notification.updateMany({ userPhone: req.params.phone, isRead: false }, { $set: { isRead: true } });
         }
         res.json({ success: true, notifications: notifs });
     } catch (e) { res.status(500).json({ success: false }); }
-});
-
-app.get('/api/notifications/stream/:phone', (req, res) => {
-    const phone = req.params.phone;
-
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*'
-    });
-
-    if (!sseClients.has(phone)) sseClients.set(phone, new Set());
-    sseClients.get(phone).add(res);
-
-    const heartbeat = setInterval(() => { res.write(': heartbeat\n\n'); }, 15000);
-
-    req.on('close', () => {
-        clearInterval(heartbeat);
-        const clients = sseClients.get(phone);
-        if (clients) {
-            clients.delete(res);
-            if (clients.size === 0) sseClients.delete(phone);
-        }
-    });
 });
 
 async function sendPushNotification(phone, title, message, type) {
@@ -145,14 +120,10 @@ async function sendPushNotification(phone, title, message, type) {
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        const notif = await Notification.create({ userPhone: formattedPhone, title, message, type });
-        const payload = JSON.stringify(notif);
-
-        if (sseClients.has(formattedPhone)) {
-            sseClients.get(formattedPhone).forEach(client => client.write(`data: ${payload}\n\n`));
-        }
-        if (phone !== formattedPhone && sseClients.has(phone)) {
-            sseClients.get(phone).forEach(client => client.write(`data: ${payload}\n\n`));
+        await Notification.create({ userPhone: formattedPhone, title, message, type });
+        
+        if (phone !== formattedPhone) {
+            await Notification.create({ userPhone: phone, title, message, type });
         }
     } catch(e) { console.error("Notification Save Error", e); }
 }
@@ -244,7 +215,6 @@ app.post('/api/deposit', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); }
 });
 
-// 🟢 CRITICAL FIX: Safe Phone Matching
 app.post('/api/megapay/webhook', async (req, res) => {
     res.status(200).send("OK");
     const data = req.body;
@@ -256,7 +226,6 @@ app.post('/api/megapay/webhook', async (req, res) => {
         const receipt = data.TransactionReceipt || data.MpesaReceiptNumber;
         let rawPhone = (data.Msisdn || data.phone || data.PhoneNumber).toString();
         
-        // Account for any format the user might have registered with
         let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
         let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
 
@@ -464,16 +433,29 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to delete user account' }); }
 });
 
+// 🟢 FIXED: Broadcasts alert to ALL users dynamically using bulkWrite
 app.post('/api/admin/push-alert', async (req, res) => {
     try {
         const { phone, title, message } = req.body;
         
         if (phone === 'ALL') {
-            const notif = await Notification.create({ userPhone: 'ALL', title, message, type: 'admin_alert' });
-            const payload = JSON.stringify(notif);
+            const users = await User.find({}, 'phone');
             
-            for (let clients of sseClients.values()) {
-                clients.forEach(client => client.write(`data: ${payload}\n\n`));
+            const bulkOps = users.map(u => ({
+                insertOne: {
+                    document: {
+                        userPhone: u.phone,
+                        title: title,
+                        message: message,
+                        type: 'admin_alert',
+                        isRead: false,
+                        createdAt: new Date()
+                    }
+                }
+            }));
+
+            if(bulkOps.length > 0) {
+                await Notification.bulkWrite(bulkOps);
             }
         } else {
             await sendPushNotification(phone, title, message, 'admin_alert');
