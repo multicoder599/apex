@@ -5,7 +5,7 @@ const path = require('path');
 const mongoose = require('mongoose');
 const axios = require('axios');
 const bcrypt = require('bcryptjs'); 
-const http = require('http');
+const http = require('http'); 
 
 const app = express();
 const server = http.createServer(app); 
@@ -88,7 +88,7 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
-// 🟢 NEW: NOTIFICATION MODEL FOR HTTP POLLING
+// 🟢 NOTIFICATION MODEL FOR HTTP POLLING
 const notificationSchema = new mongoose.Schema({
     userPhone: { type: String, required: true },
     title: { type: String, required: true },
@@ -99,7 +99,7 @@ const notificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model('Notification', notificationSchema);
 
-// 🟢 Helper function to save notifications to DB instead of Socket.io
+// 🟢 Helper function to save notifications to DB 
 async function sendPushNotification(phone, title, message, type) {
     try {
         let formattedPhone = phone.replace(/\D/g, '');
@@ -115,7 +115,7 @@ async function sendPushNotification(phone, title, message, type) {
     } catch(e) { console.error("Notification Save Error", e); }
 }
 
-// 🟢 NEW ENDPOINT: Frontend checks this every 5 seconds
+// 🟢 ENDPOINT: Frontend checks this every 5 seconds
 app.get('/api/notifications/:phone', async (req, res) => {
     try {
         const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
@@ -190,7 +190,7 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/deposit', async (req, res) => {
     try {
         const { userPhone, amount, method } = req.body;
-        if (amount < 50) return res.status(400).json({ success: false, message: 'Minimum deposit is 50 KES.' });
+        if (amount < 10) return res.status(400).json({ success: false, message: 'Minimum deposit is 10 KES.' });
 
         const user = await User.findOne({ phone: userPhone });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
@@ -298,7 +298,7 @@ app.get('/api/transactions/:phone', async (req, res) => {
 });
 
 // ==========================================
-// BETTING ENDPOINTS
+// SPORTS BETTING ENDPOINTS
 // ==========================================
 app.post('/api/place-bet', async (req, res) => {
     try {
@@ -341,6 +341,21 @@ app.post('/api/cashout', async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
         
+        // 🟢 AVIATOR INSTANT CASHOUT BYPASS
+        if (ticketId && ticketId.startsWith('AV-')) {
+            const user = await User.findOne({ phone: userPhone });
+            if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+            
+            user.balance += amount;
+            await user.save();
+            
+            await Transaction.create({ refId: ticketId, userPhone, type: 'win', method: 'Aviator Win', amount: amount });
+            sendPushNotification(user.phone, "Aviator Cashout! ✈️", `You successfully cashed out KES ${amount.toFixed(2)}.`, "cashout");
+            
+            return res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
+        }
+
+        // Normal Sportsbook Cashout
         const bet = await Bet.findOne({ ticketId: ticketId, userPhone: userPhone });
         if (!bet) return res.status(404).json({ success: false, message: 'Ticket not found.' });
         if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled.' });
@@ -481,7 +496,6 @@ app.get('/api/chat/sync', (req, res) => {
     res.json({ success: true, messages: activeChats[chatId] || [] });
 });
 
-// 🟢 Handles admin replying to the chat from Telegram
 app.post('/api/telegram/webhook', (req, res) => {
     res.sendStatus(200); 
     try {
@@ -494,7 +508,6 @@ app.post('/api/telegram/webhook', (req, res) => {
         if (match && match[1]) {
             const chatId = match[1].trim();
             if (!activeChats[chatId]) activeChats[chatId] = [];
-            // This instantly saves the admin's reply into memory so the frontend poll will catch it.
             activeChats[chatId].push({ sender: 'admin', text: message.text });
         }
     } catch(e) {}
@@ -594,6 +607,79 @@ app.get('/api/games', async (req, res) => {
         }
         res.json({ success: true, games: allGames });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to aggregate games' }); }
+});
+
+// ==========================================
+// AVIATOR GAME ENGINE (SERVER-SIDE MATH)
+// ==========================================
+let aviatorState = {
+    status: 'WAITING', // WAITING, FLYING, CRASHED
+    startTime: 0,
+    crashPoint: 1.00,
+    history: [1.24, 3.87, 11.20, 1.01, 6.42]
+};
+
+function runAviatorLoop() {
+    if (aviatorState.status === 'WAITING') {
+        // Wait 5 seconds, then take off
+        setTimeout(() => {
+            aviatorState.status = 'FLYING';
+            aviatorState.startTime = Date.now();
+            
+            // Server securely generates crash point math
+            // 40% chance of an early crash, otherwise it flies
+            aviatorState.crashPoint = Math.random() < 0.4 ? (1.00 + Math.random() * 0.5) : (1.5 + Math.random() * 10);
+            
+            // Determine exactly when it will crash based on the curve: y = e^(0.06 * t)
+            // Reverse math to find time (ms): t = ln(crashPoint) / 0.06 * 1000
+            const flightDuration = (Math.log(aviatorState.crashPoint) / 0.06) * 1000;
+            
+            setTimeout(() => {
+                // Crash event
+                aviatorState.status = 'CRASHED';
+                aviatorState.history.unshift(aviatorState.crashPoint);
+                if(aviatorState.history.length > 20) aviatorState.history.pop();
+                
+                // Wait 4 seconds, then reset to WAITING
+                setTimeout(() => {
+                    aviatorState.status = 'WAITING';
+                    runAviatorLoop(); // Infinite loop
+                }, 4000);
+                
+            }, flightDuration);
+
+        }, 5000);
+    }
+}
+// Start the engine
+runAviatorLoop();
+
+// 🟢 ENDPOINT: Aviator Sync (Frontend polls this every 1 sec)
+app.get('/api/aviator/state', (req, res) => {
+    res.json({
+        success: true,
+        status: aviatorState.status,
+        startTime: aviatorState.startTime,
+        crashPoint: aviatorState.status === 'CRASHED' ? aviatorState.crashPoint : null, // Hide crash point until it actually crashes!
+        history: aviatorState.history
+    });
+});
+
+// 🟢 ENDPOINT: Deduct balance when placing a bet
+app.post('/api/aviator/bet', async (req, res) => {
+    try {
+        const { userPhone, amount } = req.body;
+        const user = await User.findOne({ phone: userPhone });
+        
+        if (user && user.balance >= amount) {
+            user.balance -= amount;
+            await user.save();
+            await Transaction.create({ refId: `AV-BET-${Date.now()}`, userPhone, type: 'bet', method: 'Aviator Bet', amount: -amount });
+            res.json({ success: true, newBalance: user.balance });
+        } else {
+            res.status(400).json({ success: false });
+        }
+    } catch(e) { res.status(500).json({ success: false }); }
 });
 
 // ==========================================
