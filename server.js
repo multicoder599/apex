@@ -54,6 +54,7 @@ const userSchema = new mongoose.Schema({
     balance: { type: Number, default: 0 },
     bonusBalance: { type: Number, default: 0 },
     referredBy: { type: String, default: null }, 
+    notifications: { type: Array, default: [] }, // 🟢 NEW: Embedded Notifications Array
     createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
@@ -88,43 +89,55 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
-const notificationSchema = new mongoose.Schema({
-    userPhone: { type: String, required: true },
-    title: { type: String, required: true },
-    message: { type: String, required: true },
-    type: { type: String },
-    isRead: { type: Boolean, default: false },
-    createdAt: { type: Date, default: Date.now }
-});
-const Notification = mongoose.model('Notification', notificationSchema);
-
 
 // ==========================================
-// 🟢 NOTIFICATIONS (SMART POLLING ENDPOINT)
+// 🟢 NOTIFICATIONS (EMBEDDED DB LOGIC)
 // ==========================================
 
+// Endpoint to fetch unread notifications (Polled by app.js)
 app.get('/api/notifications/:phone', async (req, res) => {
     try {
-        const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
-        if (notifs.length > 0) {
-            // Instantly mark fetched notifications as read so they don't fire again
-            await Notification.updateMany({ userPhone: req.params.phone, isRead: false }, { $set: { isRead: true } });
+        const user = await User.findOne({ phone: req.params.phone });
+        if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+        // Filter out only unread notifications
+        const unreadNotifs = user.notifications.filter(n => n.isRead === false);
+
+        if (unreadNotifs.length > 0) {
+            // Instantly mark them as read in the array
+            user.notifications.forEach(n => n.isRead = true);
+            user.markModified('notifications'); // Tells Mongoose the array changed
+            await user.save();
         }
-        res.json({ success: true, notifications: notifs });
-    } catch (e) { res.status(500).json({ success: false }); }
+
+        // Return only the unread ones to trigger the UI popup (reversed so newest is first)
+        res.json({ success: true, notifications: unreadNotifs.slice().reverse() });
+    } catch (e) { 
+        res.status(500).json({ success: false }); 
+    }
 });
 
+// Universal function to push notification to a user's embedded array
 async function sendPushNotification(phone, title, message, type) {
     try {
         let formattedPhone = phone.replace(/\D/g, '');
         if (formattedPhone.startsWith('0')) formattedPhone = '254' + formattedPhone.substring(1);
         if (formattedPhone.startsWith('7') || formattedPhone.startsWith('1')) formattedPhone = '254' + formattedPhone;
 
-        await Notification.create({ userPhone: formattedPhone, title, message, type });
-        
-        if (phone !== formattedPhone) {
-            await Notification.create({ userPhone: phone, title, message, type });
-        }
+        const notifObj = {
+            id: "N-" + Date.now() + Math.floor(Math.random() * 1000),
+            title: title,
+            message: message,
+            type: type,
+            isRead: false,
+            createdAt: new Date()
+        };
+
+        // Push directly to the user document regardless of formatting
+        await User.updateMany(
+            { $or: [{ phone: phone }, { phone: formattedPhone }] },
+            { $push: { notifications: notifObj } }
+        );
     } catch(e) { console.error("Notification Save Error", e); }
 }
 
@@ -433,30 +446,24 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to delete user account' }); }
 });
 
-// 🟢 FIXED: Broadcasts alert to ALL users dynamically using bulkWrite
+// 🟢 NEW ADMIN BROADCAST (Uses Embedded Array Logic)
 app.post('/api/admin/push-alert', async (req, res) => {
     try {
         const { phone, title, message } = req.body;
         
         if (phone === 'ALL') {
-            const users = await User.find({}, 'phone');
-            
-            const bulkOps = users.map(u => ({
-                insertOne: {
-                    document: {
-                        userPhone: u.phone,
-                        title: title,
-                        message: message,
-                        type: 'admin_alert',
-                        isRead: false,
-                        createdAt: new Date()
-                    }
-                }
-            }));
+            const bObj = {
+                id: "BC-" + Date.now(),
+                title: title,
+                message: message,
+                type: 'admin_alert',
+                isRead: false,
+                createdAt: new Date()
+            };
 
-            if(bulkOps.length > 0) {
-                await Notification.bulkWrite(bulkOps);
-            }
+            // This single command instantly drops the notification into EVERY user's array
+            await User.updateMany({}, { $push: { notifications: bObj } });
+            
         } else {
             await sendPushNotification(phone, title, message, 'admin_alert');
         }
