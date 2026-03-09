@@ -104,7 +104,6 @@ const Notification = mongoose.model('Notification', notificationSchema);
 // ==========================================
 const sseClients = new Map();
 
-// Endpoint to fetch unread notifications on initial load
 app.get('/api/notifications/:phone', async (req, res) => {
     try {
         const notifs = await Notification.find({ userPhone: req.params.phone, isRead: false });
@@ -115,7 +114,6 @@ app.get('/api/notifications/:phone', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
-// SSE Live Stream Endpoint
 app.get('/api/notifications/stream/:phone', (req, res) => {
     const phone = req.params.phone;
 
@@ -129,7 +127,6 @@ app.get('/api/notifications/stream/:phone', (req, res) => {
     if (!sseClients.has(phone)) sseClients.set(phone, new Set());
     sseClients.get(phone).add(res);
 
-    // Heartbeat every 15s to keep Render connection alive
     const heartbeat = setInterval(() => { res.write(': heartbeat\n\n'); }, 15000);
 
     req.on('close', () => {
@@ -151,7 +148,6 @@ async function sendPushNotification(phone, title, message, type) {
         const notif = await Notification.create({ userPhone: formattedPhone, title, message, type });
         const payload = JSON.stringify(notif);
 
-        // Push immediately to connected SSE clients
         if (sseClients.has(formattedPhone)) {
             sseClients.get(formattedPhone).forEach(client => client.write(`data: ${payload}\n\n`));
         }
@@ -248,6 +244,7 @@ app.post('/api/deposit', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: "Payment Gateway Error. Please try again." }); }
 });
 
+// 🟢 CRITICAL FIX: Safe Phone Matching
 app.post('/api/megapay/webhook', async (req, res) => {
     res.status(200).send("OK");
     const data = req.body;
@@ -257,12 +254,17 @@ app.post('/api/megapay/webhook', async (req, res) => {
 
         const amount = parseFloat(data.TransactionAmount || data.amount || data.Amount);
         const receipt = data.TransactionReceipt || data.MpesaReceiptNumber;
-        let phone = (data.Msisdn || data.phone || data.PhoneNumber).toString();
+        let rawPhone = (data.Msisdn || data.phone || data.PhoneNumber).toString();
         
-        if (phone.startsWith('254')) phone = '0' + phone.substring(3);
+        // Account for any format the user might have registered with
+        let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
+        let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
 
-        const user = await User.findOne({ phone: phone });
-        if (!user) return;
+        const user = await User.findOne({ $or: [{ phone: phone0 }, { phone: phone254 }, { phone: rawPhone }] });
+        if (!user) {
+            console.error(`Webhook user not found for phone: ${rawPhone}`);
+            return;
+        }
 
         const existingTx = await Transaction.findOne({ refId: receipt });
         if (existingTx) return;
@@ -370,7 +372,6 @@ app.post('/api/cashout', async (req, res) => {
     try {
         const { ticketId, userPhone, amount } = req.body;
         
-        // 🟢 AVIATOR INSTANT CASHOUT BYPASS
         if (ticketId && ticketId.startsWith('AV-')) {
             const user = await User.findOne({ phone: userPhone });
             if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
@@ -384,7 +385,6 @@ app.post('/api/cashout', async (req, res) => {
             return res.json({ success: true, message: 'Cashout successful', newBalance: user.balance });
         }
 
-        // Normal Sportsbook Cashout
         const bet = await Bet.findOne({ ticketId: ticketId, userPhone: userPhone });
         if (!bet) return res.status(404).json({ success: false, message: 'Ticket not found.' });
         if (bet.status !== 'Open') return res.status(400).json({ success: false, message: 'Ticket is already settled.' });
@@ -464,13 +464,11 @@ app.delete('/api/admin/users/:phone', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to delete user account' }); }
 });
 
-// 🟢 FIXED: Server-Sent Events Push Alerts for 'ALL'
 app.post('/api/admin/push-alert', async (req, res) => {
     try {
         const { phone, title, message } = req.body;
         
         if (phone === 'ALL') {
-            // Broadcast immediately to ALL active connections
             const notif = await Notification.create({ userPhone: 'ALL', title, message, type: 'admin_alert' });
             const payload = JSON.stringify(notif);
             
@@ -478,7 +476,6 @@ app.post('/api/admin/push-alert', async (req, res) => {
                 clients.forEach(client => client.write(`data: ${payload}\n\n`));
             }
         } else {
-            // Target a specific user
             await sendPushNotification(phone, title, message, 'admin_alert');
         }
         
