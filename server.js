@@ -348,34 +348,41 @@ app.post('/api/place-bet', async (req, res) => {
     try {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
         
-        if (!userPhone || !stake || !selections || !Array.isArray(selections) || selections.length === 0) {
-            return res.status(400).json({ success: false, message: 'Invalid bet data provided.' });
+        // 🟢 FIX: Detailed validation so we know EXACTLY what is missing
+        if (!userPhone) return res.status(400).json({ success: false, message: 'Missing user phone number.' });
+        if (!selections || !Array.isArray(selections) || selections.length === 0) {
+            return res.status(400).json({ success: false, message: 'Your betslip is empty.' });
+        }
+        
+        const numStake = Number(stake);
+        if (isNaN(numStake) || numStake < 10) {
+            return res.status(400).json({ success: false, message: 'Invalid stake. Minimum is KES 10.' });
         }
 
-        // 🟢 FIX: Robust phone lookup so user is always found regardless of 07 vs 254 formatting
-        let rawPhone = userPhone.replace(/\D/g, '');
+        // 🟢 FIX: Robust phone lookup
+        let rawPhone = String(userPhone).replace(/\D/g, '');
         let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
         let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
 
         const user = await User.findOne({ $or: [{ phone: rawPhone }, { phone: phone0 }, { phone: phone254 }] });
         
-        // 🟢 FIX: Check if user actually exists before checking balance to prevent 500 crash
         if (!user) {
-            return res.status(404).json({ success: false, message: 'User session invalid. Please log out and log in again.' });
+            return res.status(404).json({ success: false, message: 'Account session error. Please log out and log in again.' });
         }
 
-        const totalAvailable = user.balance + (user.bonusBalance || 0);
+        const totalAvailable = (user.balance || 0) + (user.bonusBalance || 0);
 
-        if (totalAvailable < stake) {
-            return res.status(400).json({ success: false, message: 'Insufficient funds! Please deposit.' });
+        if (totalAvailable < numStake) {
+            return res.status(400).json({ success: false, message: 'Insufficient balance to place this bet.' });
         }
 
-        let remainingStake = stake;
+        // Deduct from balances
+        let remainingStake = numStake;
         if (user.bonusBalance >= remainingStake) {
             user.bonusBalance -= remainingStake; 
             remainingStake = 0;
         } else {
-            remainingStake -= user.bonusBalance; 
+            remainingStake -= (user.bonusBalance || 0); 
             user.bonusBalance = 0;
             user.balance -= remainingStake; 
         }
@@ -383,21 +390,38 @@ app.post('/api/place-bet', async (req, res) => {
 
         const ticketId = 'TXN-' + Math.floor(Math.random() * 900000 + 100000);
         
+        // 🟢 FIX: Clean up the data before saving
         const mappedSelections = selections.map(s => ({
-            ...s,
+            match: s.match || s.matchName || 'Unknown Match', // handles both sportsbook and virtuals payload naming
+            market: s.market || '-',
+            pick: s.pick || '-',
+            odds: Number(s.odds) || 1.00,
             status: 'Pending',
             startTime: s.startTime || Date.now() 
         }));
 
-        const newBet = new Bet({ ticketId, userPhone: user.phone, stake, potentialWin, selections: mappedSelections, type: betType || 'Sports' });
+        const newBet = new Bet({ 
+            ticketId: ticketId, 
+            userPhone: user.phone, 
+            stake: numStake, 
+            potentialWin: Number(potentialWin) || 0, 
+            selections: mappedSelections, 
+            type: betType || 'Sports' 
+        });
         await newBet.save();
 
-        await Transaction.create({ refId: ticketId, userPhone: user.phone, type: 'bet', method: `${betType || 'Sports'} Bet`, amount: -stake });
+        await Transaction.create({ 
+            refId: ticketId, 
+            userPhone: user.phone, 
+            type: 'bet', 
+            method: `${betType || 'Sports'} Bet`, 
+            amount: -numStake 
+        });
 
         res.json({ success: true, newBalance: user.balance, newBonus: user.bonusBalance, ticketId: newBet.ticketId });
     } catch (error) { 
-        console.error("Place Bet Error: ", error.message);
-        res.status(500).json({ success: false, message: 'Bet placement failed: ' + error.message }); 
+        console.error("Place Bet Error: ", error);
+        res.status(500).json({ success: false, message: 'Server Error: ' + error.message }); 
     }
 });
 
