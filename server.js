@@ -342,13 +342,12 @@ app.get('/api/test', (req, res) => {
 
 
 // ==========================================
-// 🟢 SPORTS BETTING ENDPOINTS (BUG FIXES APPLIED)
+// SPORTS BETTING ENDPOINTS
 // ==========================================
 app.post('/api/place-bet', async (req, res) => {
     try {
         const { userPhone, stake, selections, potentialWin, betType } = req.body;
         
-        // 🟢 FIX: Detailed validation so we know EXACTLY what is missing
         if (!userPhone) return res.status(400).json({ success: false, message: 'Missing user phone number.' });
         if (!selections || !Array.isArray(selections) || selections.length === 0) {
             return res.status(400).json({ success: false, message: 'Your betslip is empty.' });
@@ -359,7 +358,6 @@ app.post('/api/place-bet', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid stake. Minimum is KES 10.' });
         }
 
-        // 🟢 FIX: Robust phone lookup
         let rawPhone = String(userPhone).replace(/\D/g, '');
         let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
         let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
@@ -390,9 +388,8 @@ app.post('/api/place-bet', async (req, res) => {
 
         const ticketId = 'TXN-' + Math.floor(Math.random() * 900000 + 100000);
         
-        // 🟢 FIX: Clean up the data before saving
         const mappedSelections = selections.map(s => ({
-            match: s.match || s.matchName || 'Unknown Match', // handles both sportsbook and virtuals payload naming
+            match: s.match || s.matchName || 'Unknown Match',
             market: s.market || '-',
             pick: s.pick || '-',
             odds: Number(s.odds) || 1.00,
@@ -478,7 +475,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// 🟢 REALISTIC BACKGROUND BET SETTLEMENT (SPORTS & JACKPOT)
+// REALISTIC BACKGROUND BET SETTLEMENT (SPORTS & JACKPOT)
 // ==========================================
 setInterval(async () => {
     try {
@@ -746,7 +743,7 @@ app.get('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// SERVER-SIDE VIRTUAL LEAGUE ENGINE
+// SERVER-SIDE VIRTUAL LEAGUE ENGINE (BUG FIXES APPLIED)
 // ==========================================
 const V_TEAMS = [
     { name: "Manchester Blue", color: "#6CABDD", short: "MCI" }, { name: "Manchester Reds", color: "#DA291C", short: "MUN" },
@@ -910,6 +907,7 @@ function updateVirtualStandings(r) {
     });
 }
 
+// 🟢 FIX: Virtuals engine now safely parses the user's phone format
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
@@ -943,8 +941,14 @@ async function processVirtualRoundSettlement(r) {
                 bet.status = isWin ? 'Won' : 'Lost';
                 await bet.save(); 
                 
+                // Secure phone lookup
+                let rawPhone = bet.userPhone.replace(/\D/g, '');
+                let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
+                let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
+
+                const user = await User.findOne({ $or: [{ phone: rawPhone }, { phone: phone0 }, { phone: phone254 }] });
+
                 if(isWin) {
-                    const user = await User.findOne({ phone: bet.userPhone });
                     if(user) {
                         user.balance += bet.potentialWin;
                         await user.save();
@@ -952,7 +956,9 @@ async function processVirtualRoundSettlement(r) {
                         sendPushNotification(user.phone, "Virtual Bet Won! 🥳", `Ticket ${bet.ticketId} won KES ${bet.potentialWin}!`, "win");
                     }
                 } else {
-                    sendPushNotification(bet.userPhone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
+                    if(user) {
+                        sendPushNotification(user.phone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
+                    }
                 }
             }
         }
