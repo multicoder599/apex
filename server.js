@@ -30,6 +30,9 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
 
+// ==========================================
+// TELEGRAM BOT UTILITY (For Admin Alerts)
+// ==========================================
 function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -43,7 +46,7 @@ function sendTelegramMessage(message) {
 mongoose.connect(MONGO_URI)
   .then(() => {
       console.log('✅ Connected to MongoDB successfully!');
-      initVirtualsEngine(); 
+      initVirtualsEngine(); // 🟢 NEW: Start Virtuals Engine upon DB connection
   })
   .catch(err => console.error('❌ MongoDB connection error:', err));
 
@@ -54,23 +57,25 @@ const userSchema = new mongoose.Schema({
     balance: { type: Number, default: 0 },
     bonusBalance: { type: Number, default: 0 },
     referredBy: { type: String, default: null }, 
-    notifications: { type: Array, default: [] }, 
+    notifications: { type: Array, default: [] }, // 🟢 NEW: Embedded Notifications Array
     createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
 
+// 🟢 FIX: Removed strict enums & added defaults to prevent My Bets crashes
 const betSchema = new mongoose.Schema({
     ticketId: { type: String, required: true, unique: true },
     userPhone: { type: String, required: true },
     stake: { type: Number, required: true },
     potentialWin: { type: Number, default: 0 }, 
-    selections: { type: Array, default: [] }, // 🟢 Updated by engine to hold per-leg status and start times
+    selections: { type: Array, default: [] }, 
     type: { type: String, default: 'Sports' }, 
     status: { type: String, default: 'Open' }, 
     createdAt: { type: Date, default: Date.now }
 });
 const Bet = mongoose.model('Bet', betSchema);
 
+// 🟢 FIX: Removed strict enums for generic transaction types
 const transactionSchema = new mongoose.Schema({
     refId: { type: String, required: true, unique: true }, 
     userPhone: { type: String, required: true },
@@ -89,6 +94,7 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
+// 🟢 NEW: VIRTUALS DB MODEL
 const virtualStateSchema = new mongoose.Schema({
     seasonId: { type: String, required: true, unique: true },
     currentSeason: Number,
@@ -111,7 +117,7 @@ const fixedGameSchema = new mongoose.Schema({
 const FixedGame = mongoose.model('FixedGame', fixedGameSchema);
 
 // ==========================================
-// NOTIFICATIONS
+// 🟢 NOTIFICATIONS (EMBEDDED DB LOGIC)
 // ==========================================
 app.get('/api/notifications/:phone', async (req, res) => {
     try {
@@ -356,11 +362,11 @@ app.post('/api/place-bet', async (req, res) => {
 
         const ticketId = 'TXN-' + Math.floor(Math.random() * 900000 + 100000);
         
-        // Ensure each selection has a default status of Pending
+        // 🟢 Ensure each selection has a default status of Pending and captures startTime
         const mappedSelections = selections.map(s => ({
             ...s,
             status: 'Pending',
-            startTime: s.startTime || Date.now() // Frontend should pass this, else default to now
+            startTime: s.startTime || Date.now() 
         }));
 
         const newBet = new Bet({ ticketId, userPhone, stake, potentialWin, selections: mappedSelections, type: betType || 'Sports' });
@@ -390,6 +396,7 @@ app.post('/api/cashout', async (req, res) => {
             user.balance += amount;
             await user.save();
             
+            // Mark Aviator bet as Cashed Out
             await Bet.updateOne({ ticketId: ticketId }, { $set: { status: 'Cashed Out' } });
 
             await Transaction.create({ refId: ticketId + '-WIN', userPhone, type: 'win', method: 'Aviator Win', amount: amount });
@@ -508,7 +515,7 @@ setInterval(async () => {
 
 
 // ==========================================
-// ADMIN ROUTES & FIXED GAMES INJECTION
+// ADMIN ROUTES & PUSH ALERTS
 // ==========================================
 app.get('/api/admin/users', async (req, res) => {
     try {
@@ -560,7 +567,6 @@ app.post('/api/admin/push-alert', async (req, res) => {
 // 🟢 NEW: Fixed Games Endpoints
 app.post('/api/admin/fixed-games', async (req, res) => {
     try {
-        // Expects req.body.games to be an array of fixed game objects
         await FixedGame.insertMany(req.body.games);
         res.json({ success: true, message: "Fixed games injected successfully." });
     } catch(e) { res.status(500).json({ success: false }); }
@@ -580,7 +586,6 @@ app.delete('/api/admin/fixed-games', async (req, res) => {
     } catch(e) { res.status(500).json({ success: false }); }
 });
 
-// Standard Real Games endpoints
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
@@ -598,7 +603,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// 🟢 UNIFIED GAMES ENDPOINT (REAL DATE FIX) 🟢
+// UNIFIED GAMES ENDPOINT (REAL DATE FIX)
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -661,7 +666,7 @@ app.get('/api/games', async (req, res) => {
                         const matchDateEAT = new Date(matchTime.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
                         const nowDateEAT = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
 
-                        if (diffMins > 120) return null; // Game is likely finished
+                        if (diffMins > 120) return null; 
 
                         if (diffMins >= 0 && diffMins <= 115) {
                             status = "live";
@@ -677,14 +682,14 @@ app.get('/api/games', async (req, res) => {
                             rawTime = `Today, ${rawTime}`;
                         } else {
                             status = "upcoming";
-                            rawTime = `${rawDate}, ${rawTime}`; // Shows exact date like "15 Mar, 18:00"
+                            rawTime = `${rawDate}, ${rawTime}`; 
                         }
 
                         return {
                             id: m.id, category: m.sport_title, league: m.sport_title, cc: 'INT',
                             home: m.home_team, away: m.away_team, odds: h, draw: d, away_odds: a,
                             time: rawTime, status: status, min: min, hs: hs, as: as,
-                            commence_time: matchTime.getTime() // Pass raw timestamp for accurate settlement tracking
+                            commence_time: matchTime.getTime() 
                         };
                     }).filter(game => game !== null);
 
