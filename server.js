@@ -30,9 +30,6 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
 
-// ==========================================
-// TELEGRAM BOT UTILITY (For Admin Alerts)
-// ==========================================
 function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -46,7 +43,7 @@ function sendTelegramMessage(message) {
 mongoose.connect(MONGO_URI)
   .then(() => {
       console.log('✅ Connected to MongoDB successfully!');
-      initVirtualsEngine(); // 🟢 NEW: Start Virtuals Engine upon DB connection
+      initVirtualsEngine(); 
   })
   .catch(err => console.error('❌ MongoDB connection error:', err));
 
@@ -57,25 +54,23 @@ const userSchema = new mongoose.Schema({
     balance: { type: Number, default: 0 },
     bonusBalance: { type: Number, default: 0 },
     referredBy: { type: String, default: null }, 
-    notifications: { type: Array, default: [] }, // 🟢 NEW: Embedded Notifications Array
+    notifications: { type: Array, default: [] }, 
     createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
 
-// 🟢 FIX: Removed strict enums & added defaults to prevent My Bets crashes
 const betSchema = new mongoose.Schema({
     ticketId: { type: String, required: true, unique: true },
     userPhone: { type: String, required: true },
     stake: { type: Number, required: true },
     potentialWin: { type: Number, default: 0 }, 
-    selections: { type: Array, default: [] }, 
+    selections: { type: Array, default: [] }, // 🟢 Updated by engine to hold per-leg status and start times
     type: { type: String, default: 'Sports' }, 
     status: { type: String, default: 'Open' }, 
     createdAt: { type: Date, default: Date.now }
 });
 const Bet = mongoose.model('Bet', betSchema);
 
-// 🟢 FIX: Removed strict enums for generic transaction types
 const transactionSchema = new mongoose.Schema({
     refId: { type: String, required: true, unique: true }, 
     userPhone: { type: String, required: true },
@@ -94,7 +89,6 @@ const liveGameSchema = new mongoose.Schema({
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
-// 🟢 NEW: VIRTUALS DB MODEL
 const virtualStateSchema = new mongoose.Schema({
     seasonId: { type: String, required: true, unique: true },
     currentSeason: Number,
@@ -105,8 +99,19 @@ const virtualStateSchema = new mongoose.Schema({
 });
 const VirtualState = mongoose.model('VirtualState', virtualStateSchema);
 
+// 🟢 NEW: FIXED GAMES DB MODEL FOR PRE-DETERMINED SETTLEMENTS
+const fixedGameSchema = new mongoose.Schema({
+    matchName: { type: String, required: true }, // e.g. "Arsenal vs Chelsea"
+    result_1x2: { type: String }, // '1', 'X', or '2'
+    result_ou25: { type: String }, // 'Over' or 'Under'
+    result_ggng: { type: String }, // 'GG' or 'NG'
+    ft_score: { type: String }, // e.g. "2-1"
+    createdAt: { type: Date, default: Date.now }
+});
+const FixedGame = mongoose.model('FixedGame', fixedGameSchema);
+
 // ==========================================
-// 🟢 NOTIFICATIONS (EMBEDDED DB LOGIC)
+// NOTIFICATIONS
 // ==========================================
 app.get('/api/notifications/:phone', async (req, res) => {
     try {
@@ -350,7 +355,15 @@ app.post('/api/place-bet', async (req, res) => {
         await user.save();
 
         const ticketId = 'TXN-' + Math.floor(Math.random() * 900000 + 100000);
-        const newBet = new Bet({ ticketId, userPhone, stake, potentialWin, selections, type: betType || 'Sports' });
+        
+        // Ensure each selection has a default status of Pending
+        const mappedSelections = selections.map(s => ({
+            ...s,
+            status: 'Pending',
+            startTime: s.startTime || Date.now() // Frontend should pass this, else default to now
+        }));
+
+        const newBet = new Bet({ ticketId, userPhone, stake, potentialWin, selections: mappedSelections, type: betType || 'Sports' });
         await newBet.save();
 
         await Transaction.create({ refId: ticketId, userPhone, type: 'bet', method: `${betType || 'Sports'} Bet`, amount: -stake });
@@ -377,7 +390,6 @@ app.post('/api/cashout', async (req, res) => {
             user.balance += amount;
             await user.save();
             
-            // Mark Aviator bet as Cashed Out
             await Bet.updateOne({ ticketId: ticketId }, { $set: { status: 'Cashed Out' } });
 
             await Transaction.create({ refId: ticketId + '-WIN', userPhone, type: 'win', method: 'Aviator Win', amount: amount });
@@ -405,26 +417,73 @@ app.post('/api/cashout', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: 'Server error processing cashout' }); }
 });
 
+
 // ==========================================
-// 🟢 FAST BACKGROUND BET SETTLEMENT SIMULATOR
+// 🟢 REALISTIC BACKGROUND BET SETTLEMENT (SPORTS & JACKPOT)
 // ==========================================
 setInterval(async () => {
     try {
-        // 🟢 FIX: Ignore Virtuals and Aviator here so they don't get randomly settled
+        // Fetch open bets excluding virtuals and aviator
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
-        
+        const fixedGames = await FixedGame.find({});
+        const now = Date.now();
+
         for (let bet of openBets) {
-            // Only settle bets that are at least 2 minutes old (simulating match progress)
-            const timeDiff = Date.now() - new Date(bet.createdAt).getTime();
-            if (timeDiff < 2 * 60 * 1000) continue; 
+            let allFinished = true;
+            let hasLost = false;
+            let hasPending = false;
 
-            // 40% chance to Win for testing
-            const isWin = Math.random() < 0.40; 
+            // Iterate over every leg in the betslip or jackpot
+            for (let sel of bet.selections) {
+                if (sel.status === 'Won') continue; 
+                if (sel.status === 'Lost') { hasLost = true; break; }
+
+                // Match time + 2 Hours (120 mins) buffer for game to officially "finish"
+                let startTime = sel.startTime || new Date(bet.createdAt).getTime();
+                let endTime = startTime + (120 * 60 * 1000); 
+
+                // If the current time is before the end time, this game is still playing
+                if (now < endTime) {
+                    allFinished = false;
+                    hasPending = true;
+                    continue; 
+                }
+
+                // Game has finished playing, grade it!
+                let isWin = false;
+                let fixedMatch = fixedGames.find(fg => fg.matchName === sel.match);
+
+                if (fixedMatch) {
+                    // Use predefined Admin results
+                    if (sel.market === '1X2' || sel.market === 'Jackpot Result') isWin = (sel.pick === fixedMatch.result_1x2);
+                    else if (sel.market === 'O/U 2.5') isWin = (sel.pick === fixedMatch.result_ou25);
+                    else if (sel.market === 'GG/NG') isWin = (sel.pick === fixedMatch.result_ggng);
+                    else isWin = (sel.pick === fixedMatch.result_1x2); // fallback
+                } else {
+                    // Normal match without fixed outcome: 40% win rate
+                    isWin = Math.random() < 0.40;
+                }
+
+                sel.status = isWin ? 'Won' : 'Lost';
+                bet.markModified('selections'); // Save embedded array change
+
+                if (!isWin) {
+                    hasLost = true;
+                    break; // If one game loses, the entire multi-bet / jackpot loses immediately
+                }
+            }
+
+            // Decide Final Ticket Status
+            if (hasLost) {
+                bet.status = 'Lost';
+                await bet.save();
+                sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
             
-            bet.status = isWin ? 'Won' : 'Lost';
-            await bet.save();
-
-            if (isWin) {
+            } else if (allFinished && !hasPending) {
+                // Every single match finished and won
+                bet.status = 'Won';
+                await bet.save();
+                
                 const user = await User.findOne({ phone: bet.userPhone });
                 if (user) {
                     user.balance += bet.potentialWin;
@@ -440,18 +499,16 @@ setInterval(async () => {
                     
                     sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
                 }
-            } else {
-                // Send a push notification even if they lose so they know it settled
-                sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} didn't go your way. Better luck next time!`, "bet");
             }
         }
     } catch (error) { 
-        console.error("Settlement Error:", error.message); 
+        console.error("Realistic Settlement Error:", error.message); 
     }
-}, 60 * 1000); 
+}, 60 * 1000); // Check every minute
+
 
 // ==========================================
-// ADMIN ROUTES & PUSH ALERTS
+// ADMIN ROUTES & FIXED GAMES INJECTION
 // ==========================================
 app.get('/api/admin/users', async (req, res) => {
     try {
@@ -488,17 +545,8 @@ app.post('/api/admin/push-alert', async (req, res) => {
         const { phone, title, message } = req.body;
         
         if (phone === 'ALL') {
-            const bObj = {
-                id: "BC-" + Date.now(),
-                title: title,
-                message: message,
-                type: 'admin_alert',
-                isRead: false,
-                createdAt: new Date()
-            };
-
+            const bObj = { id: "BC-" + Date.now(), title, message, type: 'admin_alert', isRead: false, createdAt: new Date() };
             await User.updateMany({}, { $push: { notifications: bObj } });
-            
         } else {
             await sendPushNotification(phone, title, message, 'admin_alert');
         }
@@ -509,6 +557,30 @@ app.post('/api/admin/push-alert', async (req, res) => {
     }
 });
 
+// 🟢 NEW: Fixed Games Endpoints
+app.post('/api/admin/fixed-games', async (req, res) => {
+    try {
+        // Expects req.body.games to be an array of fixed game objects
+        await FixedGame.insertMany(req.body.games);
+        res.json({ success: true, message: "Fixed games injected successfully." });
+    } catch(e) { res.status(500).json({ success: false }); }
+});
+
+app.get('/api/admin/fixed-games', async (req, res) => {
+    try {
+        const games = await FixedGame.find({});
+        res.json({ success: true, games });
+    } catch(e) { res.status(500).json({ success: false }); }
+});
+
+app.delete('/api/admin/fixed-games', async (req, res) => {
+    try {
+        await FixedGame.deleteMany({});
+        res.json({ success: true, message: "Fixed games cleared." });
+    } catch(e) { res.status(500).json({ success: false }); }
+});
+
+// Standard Real Games endpoints
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
@@ -526,7 +598,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// UNIFIED GAMES ENDPOINT
+// 🟢 UNIFIED GAMES ENDPOINT (REAL DATE FIX) 🟢
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -581,28 +653,38 @@ app.get('/api/games', async (req, res) => {
                         const diffMins = Math.floor((now - matchTime.getTime()) / 60000);
                         
                         let status = "upcoming", min = null, hs = 0, as = 0;
-                        let timeStr = matchTime.toLocaleTimeString('en-GB', {hour: '2-digit', minute:'2-digit', timeZone: 'Africa/Nairobi'});
+                        
+                        // 🟢 FIX: Formatted Date and Time for real games
+                        let rawTime = matchTime.toLocaleTimeString('en-GB', {hour: '2-digit', minute:'2-digit', timeZone: 'Africa/Nairobi'});
+                        let rawDate = matchTime.toLocaleDateString('en-GB', {day: 'numeric', month: 'short', timeZone: 'Africa/Nairobi'});
 
-                        if (diffMins > 120) return null;
+                        const matchDateEAT = new Date(matchTime.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+                        const nowDateEAT = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+
+                        if (diffMins > 120) return null; // Game is likely finished
 
                         if (diffMins >= 0 && diffMins <= 115) {
                             status = "live";
-                            timeStr = "Live";
-                            min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString();
+                            rawTime = "Live";
+                            min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString() + "'";
                             
                             const homeAdv = (1 / nH) > (1 / nA) ? 1.5 : 0.5;
                             hs = Math.floor((diffMins / 90) * homeAdv * Math.random() * 4);
                             as = Math.floor((diffMins / 90) * (2 - homeAdv) * Math.random() * 4);
                             
+                        } else if (matchDateEAT.getDate() === nowDateEAT.getDate() && matchDateEAT.getMonth() === nowDateEAT.getMonth()) {
+                            status = "today";
+                            rawTime = `Today, ${rawTime}`;
                         } else {
                             status = "upcoming";
-                            timeStr = `Upcoming, ${timeStr}`;
+                            rawTime = `${rawDate}, ${rawTime}`; // Shows exact date like "15 Mar, 18:00"
                         }
 
                         return {
                             id: m.id, category: m.sport_title, league: m.sport_title, cc: 'INT',
                             home: m.home_team, away: m.away_team, odds: h, draw: d, away_odds: a,
-                            time: timeStr, status: status, min: min, hs: hs, as: as
+                            time: rawTime, status: status, min: min, hs: hs, as: as,
+                            commence_time: matchTime.getTime() // Pass raw timestamp for accurate settlement tracking
                         };
                     }).filter(game => game !== null);
 
@@ -616,7 +698,7 @@ app.get('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// 🟢 SERVER-SIDE VIRTUAL LEAGUE ENGINE 🟢
+// SERVER-SIDE VIRTUAL LEAGUE ENGINE
 // ==========================================
 const V_TEAMS = [
     { name: "Manchester Blue", color: "#6CABDD", short: "MCI" }, { name: "Manchester Reds", color: "#DA291C", short: "MUN" },
@@ -643,7 +725,6 @@ async function initVirtualsEngine() {
 
         if (dbState && dbState.rounds && dbState.rounds.length > 0) {
             const lastRound = dbState.rounds[dbState.rounds.length - 1];
-            // If server slept and season finished > 2 mins ago, reset.
             if (now > lastRound.startTime + 120000) {
                 await startNewVirtualSeason(dbState.currentSeason + 1);
             } else {
@@ -683,7 +764,7 @@ async function startNewVirtualSeason(seasonNum) {
 function generateVirtualEvents(homeProb) {
     let events = [], hs = 0, as = 0;
     for(let min = 1; min <= 90; min++) {
-        if(Math.random() < 0.032) { // Goal event
+        if(Math.random() < 0.032) { 
             if(Math.random() < homeProb) { hs++; events.push({ min, type: 'home' }); } 
             else { as++; events.push({ min, type: 'away' }); }
         }
@@ -781,7 +862,6 @@ function updateVirtualStandings(r) {
     });
 }
 
-// 🟢 DEDICATED VIRTUALS BET SETTLEMENT (PERMANENT DB RECORDING)
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
@@ -789,7 +869,6 @@ async function processVirtualRoundSettlement(r) {
         for (let bet of pendingBets) {
             let sel = bet.selections[0]; 
             
-            // Ensure the match belongs to the round that just finished
             let m = r.matches.find(mx => mx.id === sel.matchId);
             
             if (m) {
@@ -814,7 +893,7 @@ async function processVirtualRoundSettlement(r) {
                 }
                 
                 bet.status = isWin ? 'Won' : 'Lost';
-                await bet.save(); // Permanently save the outcome
+                await bet.save(); 
                 
                 if(isWin) {
                     const user = await User.findOne({ phone: bet.userPhone });
@@ -832,7 +911,6 @@ async function processVirtualRoundSettlement(r) {
     } catch(e) { console.error("Virtuals Settlement Error", e); }
 }
 
-// 🟢 PUBLIC API ENDPOINT FOR CLIENT SYNC
 app.get('/api/virtuals/state', async (req, res) => {
     res.json({ success: true, state: vState });
 });
@@ -862,7 +940,6 @@ function runAviatorLoop() {
                 aviatorState.history.unshift(aviatorState.crashPoint);
                 if(aviatorState.history.length > 20) aviatorState.history.pop();
                 
-                // Set all open Aviator bets to 'Lost' automatically upon crash
                 Bet.updateMany({ type: 'Aviator', status: 'Open' }, { $set: { status: 'Lost' } }).catch(e=>{});
                 
                 setTimeout(() => {
@@ -895,36 +972,21 @@ app.post('/api/aviator/bet', async (req, res) => {
 
         const betAmt = Number(amount);
 
-        // 🟢 Refund Logic (User cancelled before takeoff)
         if (betAmt < 0) {
             user.balance += Math.abs(betAmt);
             await user.save();
             await Transaction.create({ refId: `AV-REF-${Date.now()}`, userPhone, type: 'refund', method: 'Aviator Refund', amount: Math.abs(betAmt) });
-            
-            // Delete the bet record so it doesn't show up in history
             await Bet.findOneAndDelete({ userPhone: userPhone, type: 'Aviator', status: 'Open' });
-            
             return res.json({ success: true, newBalance: user.balance });
         }
 
-        // 🟢 Standard Bet Placement
         if (user.balance >= betAmt) {
             user.balance -= betAmt;
             await user.save();
             const tId = `AV-BET-${Date.now()}`;
             
             await Transaction.create({ refId: tId, userPhone, type: 'bet', method: 'Aviator Bet', amount: -betAmt });
-            
-            // Log Aviator to "My Bets"
-            await Bet.create({
-                ticketId: tId,
-                userPhone: user.phone,
-                stake: betAmt,
-                potentialWin: 0,
-                type: 'Aviator',
-                status: 'Open',
-                selections: [{ match: "Aviator Round", market: "Crash", pick: "Auto", odds: 1.0 }]
-            });
+            await Bet.create({ ticketId: tId, userPhone: user.phone, stake: betAmt, potentialWin: 0, type: 'Aviator', status: 'Open', selections: [{ match: "Aviator Round", market: "Crash", pick: "Auto", odds: 1.0 }] });
 
             res.json({ success: true, newBalance: user.balance });
         } else {
