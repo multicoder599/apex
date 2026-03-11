@@ -908,15 +908,17 @@ function updateVirtualStandings(r) {
     });
 }
 
-// 🟢 FIX: Flexible Market Matching Logic for Virtuals Engine
+// 🟢 FIX: Virtuals engine now safely parses the user's phone format & cleans Ghost Bets
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
+        const now = Date.now();
         
         for (let bet of pendingBets) {
             let sel = bet.selections[0]; 
             
-            let m = r.matches.find(mx => mx.id === sel.matchId);
+            // 🟢 FALLBACK: Match by ID, or by exact Team vs Team string
+            let m = r.matches.find(mx => mx.id === sel.matchId || `${mx.home.name} vs ${mx.away.name}` === sel.match);
             
             if (m) {
                 let isWin = false;
@@ -960,6 +962,23 @@ async function processVirtualRoundSettlement(r) {
                 } else {
                     if(user) {
                         sendPushNotification(user.phone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
+                    }
+                }
+            } else {
+                // 🟢 GHOST BET CLEANER: If bet is older than 5 minutes and not in this round, refund it
+                if (now - new Date(bet.createdAt).getTime() > 5 * 60 * 1000) {
+                    bet.status = 'Cashed Out'; 
+                    await bet.save();
+                    
+                    let rawPhone = bet.userPhone.replace(/\D/g, '');
+                    let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
+                    let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
+                    const user = await User.findOne({ $or: [{ phone: rawPhone }, { phone: phone0 }, { phone: phone254 }] });
+                    
+                    if(user) {
+                        user.balance += bet.stake;
+                        await user.save();
+                        await Transaction.create({ refId: `REF-${bet.ticketId}`, userPhone: user.phone, type: 'refund', method: 'Virtuals Timeout Refund', amount: bet.stake });
                     }
                 }
             }
