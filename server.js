@@ -394,7 +394,8 @@ app.post('/api/place-bet', async (req, res) => {
             pick: s.pick || '-',
             odds: Number(s.odds) || 1.00,
             status: 'Pending',
-            startTime: s.startTime || Date.now() 
+            startTime: s.startTime || Date.now(),
+            matchId: s.matchId || null 
         }));
 
         const newBet = new Bet({ 
@@ -743,7 +744,7 @@ app.get('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// SERVER-SIDE VIRTUAL LEAGUE ENGINE (BUG FIXES APPLIED)
+// SERVER-SIDE VIRTUAL LEAGUE ENGINE
 // ==========================================
 const V_TEAMS = [
     { name: "Manchester Blue", color: "#6CABDD", short: "MCI" }, { name: "Manchester Reds", color: "#DA291C", short: "MUN" },
@@ -907,7 +908,7 @@ function updateVirtualStandings(r) {
     });
 }
 
-// 🟢 FIX: Virtuals engine now safely parses the user's phone format
+// 🟢 FIX: Flexible Market Matching Logic for Virtuals Engine
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
@@ -922,17 +923,19 @@ async function processVirtualRoundSettlement(r) {
                 let total = m.hs + m.as;
                 let gg = m.hs > 0 && m.as > 0;
                 
-                if(sel.market === '1X2') {
+                let lowerMarket = sel.market.toLowerCase();
+                
+                if(lowerMarket.includes('1x2') || lowerMarket === 'match winner') {
                     if(sel.pick === '1' && m.hs > m.as) isWin = true;
                     if(sel.pick === 'X' && m.hs === m.as) isWin = true;
                     if(sel.pick === '2' && m.hs < m.as) isWin = true;
-                } else if (sel.market === 'O/U 2.5') {
-                    if(sel.pick === 'Over' && total > 2.5) isWin = true;
-                    if(sel.pick === 'Under' && total < 2.5) isWin = true;
-                } else if (sel.market === 'GG/NG') {
-                    if(sel.pick === 'GG' && gg) isWin = true;
-                    if(sel.pick === 'NG' && !gg) isWin = true;
-                } else if (sel.market === 'Double Chance') {
+                } else if (lowerMarket.includes('o/u') || lowerMarket.includes('over/under') || lowerMarket.includes('total goals')) {
+                    if(sel.pick.includes('Over') && total > 2.5) isWin = true;
+                    if(sel.pick.includes('Under') && total < 2.5) isWin = true;
+                } else if (lowerMarket.includes('gg') || lowerMarket.includes('both teams to score')) {
+                    if((sel.pick === 'GG' || sel.pick === 'Yes') && gg) isWin = true;
+                    if((sel.pick === 'NG' || sel.pick === 'No') && !gg) isWin = true;
+                } else if (lowerMarket.includes('double chance')) {
                     if(sel.pick === '1X' && m.hs >= m.as) isWin = true;
                     if(sel.pick === '12' && m.hs !== m.as) isWin = true;
                     if(sel.pick === 'X2' && m.hs <= m.as) isWin = true;
@@ -941,7 +944,6 @@ async function processVirtualRoundSettlement(r) {
                 bet.status = isWin ? 'Won' : 'Lost';
                 await bet.save(); 
                 
-                // Secure phone lookup
                 let rawPhone = bet.userPhone.replace(/\D/g, '');
                 let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
                 let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
