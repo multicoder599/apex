@@ -781,13 +781,15 @@ function updateVirtualStandings(r) {
     });
 }
 
-// 🟢 DEDICATED VIRTUALS BET SETTLEMENT 
+// 🟢 DEDICATED VIRTUALS BET SETTLEMENT (PERMANENT DB RECORDING)
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
         
         for (let bet of pendingBets) {
             let sel = bet.selections[0]; 
+            
+            // Ensure the match belongs to the round that just finished
             let m = r.matches.find(mx => mx.id === sel.matchId);
             
             if (m) {
@@ -812,7 +814,7 @@ async function processVirtualRoundSettlement(r) {
                 }
                 
                 bet.status = isWin ? 'Won' : 'Lost';
-                await bet.save();
+                await bet.save(); // Permanently save the outcome
                 
                 if(isWin) {
                     const user = await User.findOne({ phone: bet.userPhone });
@@ -822,6 +824,8 @@ async function processVirtualRoundSettlement(r) {
                         await Transaction.create({ refId: `V-WIN-${bet.ticketId}`, userPhone: user.phone, type: 'win', method: 'Virtual Winnings', amount: bet.potentialWin });
                         sendPushNotification(user.phone, "Virtual Bet Won! 🥳", `Ticket ${bet.ticketId} won KES ${bet.potentialWin}!`, "win");
                     }
+                } else {
+                    sendPushNotification(bet.userPhone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
                 }
             }
         }
