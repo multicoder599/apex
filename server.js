@@ -416,6 +416,16 @@ app.post('/api/place-bet', async (req, res) => {
             amount: -numStake 
         });
 
+        // 🟢 NEW: TELEGRAM NOTIFICATION ON TICKET PLACEMENT
+        const safeType = betType ? betType.toUpperCase() : 'SPORTS';
+        const telegramMsg = `🚨 <b>NEW ${safeType} BET</b> 🚨\n\n` +
+                            `👤 <b>User:</b> ${user.phone}\n` +
+                            `💵 <b>Stake:</b> KES ${numStake}\n` +
+                            `🏆 <b>Potential Win:</b> KES ${Number(potentialWin).toFixed(2)}\n` +
+                            `🔢 <b>Selections:</b> ${mappedSelections.length}\n` +
+                            `🧾 <b>Ticket ID:</b> ${ticketId}`;
+        sendTelegramMessage(telegramMsg);
+
         res.json({ success: true, newBalance: user.balance, newBonus: user.bonusBalance, ticketId: newBet.ticketId });
     } catch (error) { 
         console.error("Place Bet Error: ", error);
@@ -908,7 +918,6 @@ function updateVirtualStandings(r) {
     });
 }
 
-// 🟢 FIX: Virtuals engine now safely parses the user's phone format & cleans Ghost Bets
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
@@ -917,7 +926,6 @@ async function processVirtualRoundSettlement(r) {
         for (let bet of pendingBets) {
             let sel = bet.selections[0]; 
             
-            // 🟢 FALLBACK: Match by ID, or by exact Team vs Team string
             let m = r.matches.find(mx => mx.id === sel.matchId || `${mx.home.name} vs ${mx.away.name}` === sel.match);
             
             if (m) {
@@ -965,7 +973,6 @@ async function processVirtualRoundSettlement(r) {
                     }
                 }
             } else {
-                // 🟢 GHOST BET CLEANER: If bet is older than 5 minutes and not in this round, refund it
                 if (now - new Date(bet.createdAt).getTime() > 5 * 60 * 1000) {
                     bet.status = 'Cashed Out'; 
                     await bet.save();
@@ -1065,8 +1072,15 @@ app.post('/api/aviator/bet', async (req, res) => {
             await user.save();
             const tId = `AV-BET-${Date.now()}`;
             
+            // 🟢 NEW: TELEGRAM NOTIFICATION ON AVIATOR BET
             await Transaction.create({ refId: tId, userPhone: user.phone, type: 'bet', method: 'Aviator Bet', amount: -betAmt });
             await Bet.create({ ticketId: tId, userPhone: user.phone, stake: betAmt, potentialWin: 0, type: 'Aviator', status: 'Open', selections: [{ match: "Aviator Round", market: "Crash", pick: "Auto", odds: 1.0 }] });
+
+            const telegramMsg = `✈️ <b>NEW AVIATOR BET</b> ✈️\n\n` +
+                                `👤 <b>User:</b> ${user.phone}\n` +
+                                `💵 <b>Stake:</b> KES ${betAmt}\n` +
+                                `🧾 <b>Ticket ID:</b> ${tId}`;
+            sendTelegramMessage(telegramMsg);
 
             res.json({ success: true, newBalance: user.balance });
         } else {
