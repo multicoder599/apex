@@ -112,6 +112,15 @@ const fixedGameSchema = new mongoose.Schema({
 });
 const FixedGame = mongoose.model('FixedGame', fixedGameSchema);
 
+// 🟢 NEW: BOOKING CODE SCHEMA (Auto-deletes after 48 hours)
+const bookingSchema = new mongoose.Schema({
+    code: { type: String, required: true, unique: true },
+    selections: { type: Array, required: true },
+    createdAt: { type: Date, default: Date.now, expires: 172800 } 
+});
+const Booking = mongoose.model('Booking', bookingSchema);
+
+
 // ==========================================
 // NOTIFICATIONS
 // ==========================================
@@ -342,6 +351,44 @@ app.get('/api/test', (req, res) => {
 
 
 // ==========================================
+// 🟢 BOOKING CODE ENDPOINTS
+// ==========================================
+app.post('/api/book-bet', async (req, res) => {
+    try {
+        const { selections } = req.body;
+        
+        if (!selections || !Array.isArray(selections) || selections.length === 0) {
+            return res.status(400).json({ success: false, message: 'Betslip is empty.' });
+        }
+        
+        // Generate a 6-character random alphanumeric code
+        const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+        
+        await Booking.create({ code, selections });
+        res.json({ success: true, code: code });
+    } catch (error) {
+        console.error("Booking Error:", error);
+        res.status(500).json({ success: false, message: 'Failed to generate booking code.' });
+    }
+});
+
+app.get('/api/book-bet/:code', async (req, res) => {
+    try {
+        const code = req.params.code.trim().toUpperCase();
+        const booking = await Booking.findOne({ code });
+        
+        if (!booking) {
+            return res.status(404).json({ success: false, message: 'Invalid or expired booking code.' });
+        }
+        
+        res.json({ success: true, selections: booking.selections });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Failed to load booking code.' });
+    }
+});
+
+
+// ==========================================
 // SPORTS BETTING ENDPOINTS
 // ==========================================
 app.post('/api/place-bet', async (req, res) => {
@@ -416,7 +463,6 @@ app.post('/api/place-bet', async (req, res) => {
             amount: -numStake 
         });
 
-        // 🟢 NEW: TELEGRAM NOTIFICATION ON TICKET PLACEMENT
         const safeType = betType ? betType.toUpperCase() : 'SPORTS';
         const telegramMsg = `🚨 <b>NEW ${safeType} BET</b> 🚨\n\n` +
                             `👤 <b>User:</b> ${user.phone}\n` +
@@ -1072,7 +1118,6 @@ app.post('/api/aviator/bet', async (req, res) => {
             await user.save();
             const tId = `AV-BET-${Date.now()}`;
             
-            // 🟢 NEW: TELEGRAM NOTIFICATION ON AVIATOR BET
             await Transaction.create({ refId: tId, userPhone: user.phone, type: 'bet', method: 'Aviator Bet', amount: -betAmt });
             await Bet.create({ ticketId: tId, userPhone: user.phone, stake: betAmt, potentialWin: 0, type: 'Aviator', status: 'Open', selections: [{ match: "Aviator Round", market: "Crash", pick: "Auto", odds: 1.0 }] });
 
