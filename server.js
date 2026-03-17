@@ -112,7 +112,6 @@ const fixedGameSchema = new mongoose.Schema({
 });
 const FixedGame = mongoose.model('FixedGame', fixedGameSchema);
 
-// 🟢 NEW: BOOKING CODE SCHEMA (Auto-deletes after 48 hours)
 const bookingSchema = new mongoose.Schema({
     code: { type: String, required: true, unique: true },
     selections: { type: Array, required: true },
@@ -361,7 +360,6 @@ app.post('/api/book-bet', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Betslip is empty.' });
         }
         
-        // Generate a 6-character random alphanumeric code
         const code = Math.random().toString(36).substring(2, 8).toUpperCase();
         
         await Booking.create({ code, selections });
@@ -532,7 +530,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// REALISTIC BACKGROUND BET SETTLEMENT (SPORTS & JACKPOT)
+// 🟢 REALISTIC BACKGROUND BET SETTLEMENT (SPORTS & JACKPOT)
 // ==========================================
 setInterval(async () => {
     try {
@@ -549,7 +547,13 @@ setInterval(async () => {
                 if (sel.status === 'Won') continue; 
                 if (sel.status === 'Lost') { hasLost = true; break; }
 
-                let startTime = sel.startTime || new Date(bet.createdAt).getTime();
+                // 🟢 FIX: Ensure startTime is strictly parsed to avoid Date.now() bypasses
+                let startTime = Number(sel.startTime);
+                if (!startTime || isNaN(startTime)) {
+                     startTime = new Date(bet.createdAt).getTime();
+                }
+                
+                // Exactly 2 hours AFTER the game officially starts
                 let endTime = startTime + (120 * 60 * 1000); 
 
                 if (now < endTime) {
@@ -701,7 +705,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// UNIFIED GAMES ENDPOINT
+// UNIFIED GAMES ENDPOINT (🟢 WITH TIME PARSER)
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -710,7 +714,29 @@ const API_CACHE_DURATION = 5 * 60 * 1000;
 app.get('/api/games', async (req, res) => {
     try {
         const dbGamesRaw = await LiveGame.find({});
-        let allGames = dbGamesRaw.map(g => g.toObject());
+        
+        // 🟢 FIX: Parse custom text strings (e.g. "Today, 23:00") into strict timestamps
+        let allGames = dbGamesRaw.map(g => {
+            let match = g.toObject();
+            if (!match.commence_time && match.time) {
+                try {
+                    let d = new Date();
+                    let timeStr = match.time;
+                    if (timeStr.includes(':')) {
+                        let timeMatch = timeStr.match(/(\d{1,2}):(\d{2})/);
+                        if (timeMatch) {
+                            d.setHours(parseInt(timeMatch[1]), parseInt(timeMatch[2]), 0, 0);
+                            if (timeStr.toLowerCase().includes('tomorrow')) {
+                                d.setDate(d.getDate() + 1);
+                            }
+                            match.commence_time = d.getTime();
+                        }
+                    }
+                } catch(e) {}
+            }
+            if (!match.commence_time) match.commence_time = Date.now();
+            return match;
+        });
 
         if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
             const now = Date.now();
