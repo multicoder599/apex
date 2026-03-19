@@ -119,6 +119,25 @@ const bookingSchema = new mongoose.Schema({
 });
 const Booking = mongoose.model('Booking', bookingSchema);
 
+// 🟢 NEW: ADMIN CONTROL SETTINGS SCHEMA
+const configSchema = new mongoose.Schema({
+    settingId: { type: String, default: 'global', unique: true },
+    aviatorWinChance: { type: Number, default: 30 }, // Default 30% chance for Aviator to go high
+    virtualsMargin: { type: Number, default: 1.20 }  // Default House Edge for Virtuals (Higher = Lower Payouts)
+});
+const SystemConfig = mongoose.model('SystemConfig', configSchema);
+
+// Load Settings into Memory for fast access
+let globalSettings = { aviatorWinChance: 30, virtualsMargin: 1.20 };
+SystemConfig.findOne({ settingId: 'global' }).then(conf => {
+    if (conf) { 
+        globalSettings.aviatorWinChance = conf.aviatorWinChance; 
+        globalSettings.virtualsMargin = conf.virtualsMargin; 
+    } else { 
+        SystemConfig.create({ settingId: 'global', aviatorWinChance: 30, virtualsMargin: 1.20 }); 
+    }
+});
+
 
 // ==========================================
 // NOTIFICATIONS
@@ -350,18 +369,15 @@ app.get('/api/test', (req, res) => {
 
 
 // ==========================================
-// 🟢 BOOKING CODE ENDPOINTS
+// BOOKING CODE ENDPOINTS
 // ==========================================
 app.post('/api/book-bet', async (req, res) => {
     try {
         const { selections } = req.body;
-        
         if (!selections || !Array.isArray(selections) || selections.length === 0) {
             return res.status(400).json({ success: false, message: 'Betslip is empty.' });
         }
-        
         const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-        
         await Booking.create({ code, selections });
         res.json({ success: true, code: code });
     } catch (error) {
@@ -374,15 +390,9 @@ app.get('/api/book-bet/:code', async (req, res) => {
     try {
         const code = req.params.code.trim().toUpperCase();
         const booking = await Booking.findOne({ code });
-        
-        if (!booking) {
-            return res.status(404).json({ success: false, message: 'Invalid or expired booking code.' });
-        }
-        
+        if (!booking) return res.status(404).json({ success: false, message: 'Invalid or expired booking code.' });
         res.json({ success: true, selections: booking.selections });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to load booking code.' });
-    }
+    } catch (error) { res.status(500).json({ success: false, message: 'Failed to load booking code.' }); }
 });
 
 
@@ -530,7 +540,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// 🟢 REALISTIC BACKGROUND BET SETTLEMENT (SPORTS & JACKPOT)
+// REALISTIC BACKGROUND BET SETTLEMENT
 // ==========================================
 setInterval(async () => {
     try {
@@ -547,13 +557,11 @@ setInterval(async () => {
                 if (sel.status === 'Won') continue; 
                 if (sel.status === 'Lost') { hasLost = true; break; }
 
-                // 🟢 FIX: Ensure startTime is strictly parsed to avoid Date.now() bypasses
                 let startTime = Number(sel.startTime);
                 if (!startTime || isNaN(startTime)) {
                      startTime = new Date(bet.createdAt).getTime();
                 }
                 
-                // Exactly 2 hours AFTER the game officially starts
                 let endTime = startTime + (120 * 60 * 1000); 
 
                 if (now < endTime) {
@@ -617,8 +625,23 @@ setInterval(async () => {
 
 
 // ==========================================
-// ADMIN ROUTES & PUSH ALERTS
+// 🟢 ADMIN ROUTES & GAME CONTROLS
 // ==========================================
+app.get('/api/admin/config', async (req, res) => {
+    res.json({ success: true, config: globalSettings });
+});
+
+app.post('/api/admin/config', async (req, res) => {
+    try {
+        const { aviatorWinChance, virtualsMargin } = req.body;
+        globalSettings.aviatorWinChance = Number(aviatorWinChance) || 30;
+        globalSettings.virtualsMargin = Number(virtualsMargin) || 1.20;
+        
+        await SystemConfig.updateOne({ settingId: 'global' }, { $set: globalSettings }, { upsert: true });
+        res.json({ success: true, message: 'Settings updated successfully', config: globalSettings });
+    } catch(e) { res.status(500).json({ success: false }); }
+});
+
 app.get('/api/admin/users', async (req, res) => {
     try {
         const users = await User.find({}).select('-password').sort({ createdAt: -1 });
@@ -666,7 +689,6 @@ app.post('/api/admin/push-alert', async (req, res) => {
     }
 });
 
-// Fixed Games Endpoints
 app.post('/api/admin/fixed-games', async (req, res) => {
     try {
         await FixedGame.insertMany(req.body.games);
@@ -705,7 +727,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// UNIFIED GAMES ENDPOINT (🟢 WITH TIME PARSER)
+// UNIFIED GAMES ENDPOINT
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -715,7 +737,6 @@ app.get('/api/games', async (req, res) => {
     try {
         const dbGamesRaw = await LiveGame.find({});
         
-        // 🟢 FIX: Parse custom text strings (e.g. "Today, 23:00") into strict timestamps
         let allGames = dbGamesRaw.map(g => {
             let match = g.toObject();
             if (!match.commence_time && match.time) {
@@ -826,7 +847,7 @@ app.get('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// SERVER-SIDE VIRTUAL LEAGUE ENGINE
+// 🟢 SERVER-SIDE VIRTUAL LEAGUE ENGINE (WITH MARGIN CONTROL)
 // ==========================================
 const V_TEAMS = [
     { name: "Manchester Blue", color: "#6CABDD", short: "MCI" }, { name: "Manchester Reds", color: "#DA291C", short: "MUN" },
@@ -911,7 +932,9 @@ function generateVirtualRound(matchday, startTime) {
         let p2 = Math.random() * 0.35 + 0.15; 
         let px = Math.max(0.15, 1 - (p1 + p2)); 
         
-        const margin = 1.12; 
+        // 🟢 SMART CONTROL: Use Admin Panel Margin to lower payouts
+        const margin = globalSettings.virtualsMargin || 1.20; 
+        
         const hBase = (1 / (p1 * margin)).toFixed(2);
         const dBase = (1 / (px * margin)).toFixed(2);
         const aBase = (1 / (p2 * margin)).toFixed(2);
@@ -1071,7 +1094,7 @@ app.get('/api/virtuals/state', async (req, res) => {
 
 
 // ==========================================
-// AVIATOR ENGINE (UNTOUCHED)
+// 🟢 AVIATOR ENGINE (WITH WIN-CHANCE CONTROL)
 // ==========================================
 let aviatorState = {
     status: 'WAITING',
@@ -1086,7 +1109,17 @@ function runAviatorLoop() {
             aviatorState.status = 'FLYING';
             aviatorState.startTime = Date.now();
             
-            aviatorState.crashPoint = Math.random() < 0.4 ? (1.00 + Math.random() * 0.5) : (1.5 + Math.random() * 10);
+            // 🟢 SMART CONTROL: Use Admin Panel Percentage
+            const winChanceDec = (globalSettings.aviatorWinChance || 30) / 100; 
+            
+            // If random is greater than win chance, force an early crash (1.00x - 1.40x)
+            if (Math.random() > winChanceDec) {
+                aviatorState.crashPoint = 1.00 + (Math.random() * 0.40);
+            } else {
+                // Otherwise, let it fly higher (1.40x - 10.00x)
+                aviatorState.crashPoint = 1.40 + (Math.random() * 8.60);
+            }
+
             const flightDuration = (Math.log(aviatorState.crashPoint) / 0.06) * 1000;
             
             setTimeout(() => {
