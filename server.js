@@ -122,8 +122,8 @@ const Booking = mongoose.model('Booking', bookingSchema);
 // 🟢 NEW: ADMIN CONTROL SETTINGS SCHEMA
 const configSchema = new mongoose.Schema({
     settingId: { type: String, default: 'global', unique: true },
-    aviatorWinChance: { type: Number, default: 30 }, // Default 30% chance for Aviator to go high
-    virtualsMargin: { type: Number, default: 1.20 }  // Default House Edge for Virtuals (Higher = Lower Payouts)
+    aviatorWinChance: { type: Number, default: 30 },
+    virtualsMargin: { type: Number, default: 1.20 }
 });
 const SystemConfig = mongoose.model('SystemConfig', configSchema);
 
@@ -540,7 +540,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// REALISTIC BACKGROUND BET SETTLEMENT
+// 🟢 REALISTIC BACKGROUND BET SETTLEMENT (WITH SCORE STAMPING)
 // ==========================================
 setInterval(async () => {
     try {
@@ -553,7 +553,12 @@ setInterval(async () => {
             let hasLost = false;
             let hasPending = false;
 
-            for (let sel of bet.selections) {
+            // Clone selections so we can modify and save them back cleanly
+            let updatedSelections = [...bet.selections];
+
+            for (let i = 0; i < updatedSelections.length; i++) {
+                let sel = updatedSelections[i];
+
                 if (sel.status === 'Won') continue; 
                 if (sel.status === 'Lost') { hasLost = true; break; }
 
@@ -574,12 +579,16 @@ setInterval(async () => {
                 let fixedMatch = fixedGames.find(fg => fg.matchName === sel.match);
 
                 if (fixedMatch) {
+                    // 🟢 STAMP THE FIXED SCORE TO THE TICKET
+                    sel.finalScore = fixedMatch.ft_score || "Settled"; 
+
                     if (sel.market === '1X2' || sel.market === 'Jackpot Result') isWin = (sel.pick === fixedMatch.result_1x2);
                     else if (sel.market === 'O/U 2.5') isWin = (sel.pick === fixedMatch.result_ou25);
                     else if (sel.market === 'GG/NG') isWin = (sel.pick === fixedMatch.result_ggng);
                     else if (sel.market === 'Correct Score') isWin = (sel.pick === fixedMatch.ft_score); 
                     else isWin = (sel.pick === fixedMatch.result_1x2); 
                 } else {
+                    sel.finalScore = "Settled"; 
                     if (sel.market === 'Correct Score') {
                         isWin = Math.random() < 0.05; 
                     } else {
@@ -588,13 +597,16 @@ setInterval(async () => {
                 }
 
                 sel.status = isWin ? 'Won' : 'Lost';
-                bet.markModified('selections'); 
 
                 if (!isWin) {
                     hasLost = true;
                     break; 
                 }
             }
+
+            // Assign the newly mapped array back and explicitly mark modified
+            bet.selections = updatedSelections;
+            bet.markModified('selections');
 
             if (hasLost) {
                 bet.status = 'Lost';
@@ -625,7 +637,7 @@ setInterval(async () => {
 
 
 // ==========================================
-// 🟢 ADMIN ROUTES & GAME CONTROLS
+// ADMIN ROUTES & GAME CONTROLS
 // ==========================================
 app.get('/api/admin/config', async (req, res) => {
     res.json({ success: true, config: globalSettings });
@@ -689,6 +701,7 @@ app.post('/api/admin/push-alert', async (req, res) => {
     }
 });
 
+// Fixed Games Endpoints
 app.post('/api/admin/fixed-games', async (req, res) => {
     try {
         await FixedGame.insertMany(req.body.games);
@@ -847,7 +860,7 @@ app.get('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// 🟢 SERVER-SIDE VIRTUAL LEAGUE ENGINE (WITH MARGIN CONTROL)
+// SERVER-SIDE VIRTUAL LEAGUE ENGINE
 // ==========================================
 const V_TEAMS = [
     { name: "Manchester Blue", color: "#6CABDD", short: "MCI" }, { name: "Manchester Reds", color: "#DA291C", short: "MUN" },
@@ -932,7 +945,6 @@ function generateVirtualRound(matchday, startTime) {
         let p2 = Math.random() * 0.35 + 0.15; 
         let px = Math.max(0.15, 1 - (p1 + p2)); 
         
-        // 🟢 SMART CONTROL: Use Admin Panel Margin to lower payouts
         const margin = globalSettings.virtualsMargin || 1.20; 
         
         const hBase = (1 / (p1 * margin)).toFixed(2);
@@ -1094,7 +1106,7 @@ app.get('/api/virtuals/state', async (req, res) => {
 
 
 // ==========================================
-// 🟢 AVIATOR ENGINE (WITH WIN-CHANCE CONTROL)
+// AVIATOR ENGINE
 // ==========================================
 let aviatorState = {
     status: 'WAITING',
@@ -1109,14 +1121,11 @@ function runAviatorLoop() {
             aviatorState.status = 'FLYING';
             aviatorState.startTime = Date.now();
             
-            // 🟢 SMART CONTROL: Use Admin Panel Percentage
             const winChanceDec = (globalSettings.aviatorWinChance || 30) / 100; 
             
-            // If random is greater than win chance, force an early crash (1.00x - 1.40x)
             if (Math.random() > winChanceDec) {
                 aviatorState.crashPoint = 1.00 + (Math.random() * 0.40);
             } else {
-                // Otherwise, let it fly higher (1.40x - 10.00x)
                 aviatorState.crashPoint = 1.40 + (Math.random() * 8.60);
             }
 
