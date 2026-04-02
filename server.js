@@ -211,7 +211,15 @@ app.post('/api/register', async (req, res) => {
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
-
+// Express.js example
+app.get('/:page.html', (req, res, next) => {
+    if (req.query._spa === '1' || req.headers['x-requested-with'] === 'XMLHttpRequest') {
+        // Return only the main content, not the full HTML
+        res.sendFile(path.join(__dirname, 'public', req.params.page + '.html'));
+    } else {
+        next();
+    }
+});
 app.post('/api/login', async (req, res) => {
     try {
         const { phone, password } = req.body;
