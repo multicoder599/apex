@@ -211,15 +211,7 @@ app.post('/api/register', async (req, res) => {
         res.json({ success: true, user: { name: newUser.name, balance: newUser.balance, bonusBalance: newUser.bonusBalance, phone: newUser.phone } });
     } catch (error) { res.status(500).json({ success: false, message: 'Server error' }); }
 });
-// Express.js example
-app.get('/:page.html', (req, res, next) => {
-    if (req.query._spa === '1' || req.headers['x-requested-with'] === 'XMLHttpRequest') {
-        // Return only the main content, not the full HTML
-        res.sendFile(path.join(__dirname, 'public', req.params.page + '.html'));
-    } else {
-        next();
-    }
-});
+
 app.post('/api/login', async (req, res) => {
     try {
         const { phone, password } = req.body;
@@ -548,7 +540,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// 🟢 REALISTIC BACKGROUND BET SETTLEMENT (WITH SCORE STAMPING)
+// 🟢 FIXED: REALISTIC BACKGROUND BET SETTLEMENT (Strict Timezone Lock)
 // ==========================================
 setInterval(async () => {
     try {
@@ -561,7 +553,6 @@ setInterval(async () => {
             let hasLost = false;
             let hasPending = false;
 
-            // Clone selections so we can modify and save them back cleanly
             let updatedSelections = [...bet.selections];
 
             for (let i = 0; i < updatedSelections.length; i++) {
@@ -575,6 +566,7 @@ setInterval(async () => {
                      startTime = new Date(bet.createdAt).getTime();
                 }
                 
+                // Exactly 2 Hours after the guaranteed correct startTime
                 let endTime = startTime + (120 * 60 * 1000); 
 
                 if (now < endTime) {
@@ -587,7 +579,6 @@ setInterval(async () => {
                 let fixedMatch = fixedGames.find(fg => fg.matchName === sel.match);
 
                 if (fixedMatch) {
-                    // 🟢 STAMP THE FIXED SCORE TO THE TICKET
                     sel.finalScore = fixedMatch.ft_score || "Settled"; 
 
                     if (sel.market === '1X2' || sel.market === 'Jackpot Result') isWin = (sel.pick === fixedMatch.result_1x2);
@@ -612,7 +603,6 @@ setInterval(async () => {
                 }
             }
 
-            // Assign the newly mapped array back and explicitly mark modified
             bet.selections = updatedSelections;
             bet.markModified('selections');
 
@@ -709,7 +699,6 @@ app.post('/api/admin/push-alert', async (req, res) => {
     }
 });
 
-// Fixed Games Endpoints
 app.post('/api/admin/fixed-games', async (req, res) => {
     try {
         await FixedGame.insertMany(req.body.games);
@@ -748,7 +737,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// UNIFIED GAMES ENDPOINT
+// 🟢 FIXED: UNIFIED GAMES ENDPOINT (Strict Timezone Parsing)
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -762,16 +751,25 @@ app.get('/api/games', async (req, res) => {
             let match = g.toObject();
             if (!match.commence_time && match.time) {
                 try {
-                    let d = new Date();
                     let timeStr = match.time;
                     if (timeStr.includes(':')) {
                         let timeMatch = timeStr.match(/(\d{1,2}):(\d{2})/);
                         if (timeMatch) {
-                            d.setHours(parseInt(timeMatch[1]), parseInt(timeMatch[2]), 0, 0);
+                            let d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+                            
                             if (timeStr.toLowerCase().includes('tomorrow')) {
                                 d.setDate(d.getDate() + 1);
                             }
-                            match.commence_time = d.getTime();
+                            
+                            let year = d.getFullYear();
+                            let month = String(d.getMonth() + 1).padStart(2, '0');
+                            let date = String(d.getDate()).padStart(2, '0');
+                            let hrs = String(timeMatch[1]).padStart(2, '0');
+                            let mins = String(timeMatch[2]).padStart(2, '0');
+                            
+                            // Explicitly force EAT (+03:00) so server UTC doesn't skew it
+                            let exactEpoch = new Date(`${year}-${month}-${date}T${hrs}:${mins}:00+03:00`).getTime();
+                            match.commence_time = exactEpoch;
                         }
                     }
                 } catch(e) {}
