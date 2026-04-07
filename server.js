@@ -119,7 +119,7 @@ const bookingSchema = new mongoose.Schema({
 });
 const Booking = mongoose.model('Booking', bookingSchema);
 
-// 🟢 NEW: ADMIN CONTROL SETTINGS SCHEMA
+// 🟢 ADMIN CONTROL SETTINGS SCHEMA
 const configSchema = new mongoose.Schema({
     settingId: { type: String, default: 'global', unique: true },
     aviatorWinChance: { type: Number, default: 30 },
@@ -397,7 +397,7 @@ app.get('/api/book-bet/:code', async (req, res) => {
 
 
 // ==========================================
-// SPORTS BETTING ENDPOINTS
+// SPORTS BETTING ENDPOINTS (Added Outcome init)
 // ==========================================
 app.post('/api/place-bet', async (req, res) => {
     try {
@@ -449,6 +449,7 @@ app.post('/api/place-bet', async (req, res) => {
             pick: s.pick || '-',
             odds: Number(s.odds) || 1.00,
             status: 'Pending',
+            outcome: 'Pending', // <-- ADDED for Detail View mapping
             startTime: s.startTime || Date.now(),
             matchId: s.matchId || null 
         }));
@@ -540,7 +541,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// 🟢 FIXED: REALISTIC BACKGROUND BET SETTLEMENT (Strict Timezone Lock)
+// 🟢 FIXED: REALISTIC BACKGROUND BET SETTLEMENT (Applies correct Outcome)
 // ==========================================
 setInterval(async () => {
     try {
@@ -580,18 +581,36 @@ setInterval(async () => {
 
                 if (fixedMatch) {
                     sel.finalScore = fixedMatch.ft_score || "Settled"; 
+                    sel.ftScore = sel.finalScore; // Pass to detail view
 
-                    if (sel.market === '1X2' || sel.market === 'Jackpot Result') isWin = (sel.pick === fixedMatch.result_1x2);
-                    else if (sel.market === 'O/U 2.5') isWin = (sel.pick === fixedMatch.result_ou25);
-                    else if (sel.market === 'GG/NG') isWin = (sel.pick === fixedMatch.result_ggng);
-                    else if (sel.market === 'Correct Score') isWin = (sel.pick === fixedMatch.ft_score); 
-                    else isWin = (sel.pick === fixedMatch.result_1x2); 
+                    // Validate against actual result and save the outcome
+                    if (sel.market === '1X2' || sel.market === 'Match Winner') {
+                        isWin = (sel.pick === fixedMatch.result_1x2);
+                        sel.outcome = fixedMatch.result_1x2;
+                    } else if (sel.market === 'O/U 2.5') {
+                        isWin = (sel.pick === fixedMatch.result_ou25);
+                        sel.outcome = fixedMatch.result_ou25;
+                    } else if (sel.market === 'GG/NG') {
+                        isWin = (sel.pick === fixedMatch.result_ggng);
+                        sel.outcome = fixedMatch.result_ggng;
+                    } else if (sel.market === 'Correct Score') {
+                        isWin = (sel.pick === fixedMatch.ft_score);
+                        sel.outcome = fixedMatch.ft_score;
+                    } else {
+                        isWin = (sel.pick === fixedMatch.result_1x2);
+                        sel.outcome = fixedMatch.result_1x2;
+                    }
                 } else {
+                    // Random settlement logic
                     sel.finalScore = "Settled"; 
+                    sel.ftScore = sel.finalScore;
+                    
                     if (sel.market === 'Correct Score') {
                         isWin = Math.random() < 0.05; 
+                        sel.outcome = isWin ? sel.pick : "Other";
                     } else {
                         isWin = Math.random() < 0.40;
+                        sel.outcome = isWin ? sel.pick : "Other";
                     }
                 }
 
@@ -604,7 +623,7 @@ setInterval(async () => {
             }
 
             bet.selections = updatedSelections;
-            bet.markModified('selections');
+            bet.markModified('selections'); // Critical for saving sub-document updates
 
             if (hasLost) {
                 bet.status = 'Lost';
@@ -737,7 +756,7 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// 🟢 FIXED: UNIFIED GAMES ENDPOINT (Strict Timezone Parsing)
+// UNIFIED GAMES ENDPOINT (Strict Timezone Parsing)
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
@@ -1031,74 +1050,100 @@ function updateVirtualStandings(r) {
     });
 }
 
+// 🟢 FIXED: VIRTUAL SETTLEMENT (Applies correct Outcome logic)
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
         const now = Date.now();
         
         for (let bet of pendingBets) {
-            let sel = bet.selections[0]; 
-            
-            let m = r.matches.find(mx => mx.id === sel.matchId || `${mx.home.name} vs ${mx.away.name}` === sel.match);
-            
-            if (m) {
-                let isWin = false;
-                let total = m.hs + m.as;
-                let gg = m.hs > 0 && m.as > 0;
+            let updatedSelections = [...bet.selections];
+            let hasLost = false;
+            let allFinished = true; // Assume true unless proven otherwise
+
+            for (let i = 0; i < updatedSelections.length; i++) {
+                let sel = updatedSelections[i]; 
                 
-                let lowerMarket = sel.market.toLowerCase();
+                let m = r.matches.find(mx => mx.id === sel.matchId || `${mx.home.name} vs ${mx.away.name}` === sel.match);
                 
-                if(lowerMarket.includes('1x2') || lowerMarket === 'match winner') {
-                    if(sel.pick === '1' && m.hs > m.as) isWin = true;
-                    if(sel.pick === 'X' && m.hs === m.as) isWin = true;
-                    if(sel.pick === '2' && m.hs < m.as) isWin = true;
-                } else if (lowerMarket.includes('o/u') || lowerMarket.includes('over/under') || lowerMarket.includes('total goals')) {
-                    if(sel.pick.includes('Over') && total > 2.5) isWin = true;
-                    if(sel.pick.includes('Under') && total < 2.5) isWin = true;
-                } else if (lowerMarket.includes('gg') || lowerMarket.includes('both teams to score')) {
-                    if((sel.pick === 'GG' || sel.pick === 'Yes') && gg) isWin = true;
-                    if((sel.pick === 'NG' || sel.pick === 'No') && !gg) isWin = true;
-                } else if (lowerMarket.includes('double chance')) {
-                    if(sel.pick === '1X' && m.hs >= m.as) isWin = true;
-                    if(sel.pick === '12' && m.hs !== m.as) isWin = true;
-                    if(sel.pick === 'X2' && m.hs <= m.as) isWin = true;
+                if (m) {
+                    let isWin = false;
+                    let total = m.hs + m.as;
+                    let gg = m.hs > 0 && m.as > 0;
+                    let lowerMarket = sel.market.toLowerCase();
+                    let actualOutcome = "-";
+
+                    sel.ftScore = `${m.hs}:${m.as}`;
+
+                    if(lowerMarket.includes('1x2') || lowerMarket === 'match winner') {
+                        actualOutcome = m.hs > m.as ? '1' : (m.hs === m.as ? 'X' : '2');
+                        if(sel.pick === '1' && m.hs > m.as) isWin = true;
+                        if(sel.pick === 'X' && m.hs === m.as) isWin = true;
+                        if(sel.pick === '2' && m.hs < m.as) isWin = true;
+                    } else if (lowerMarket.includes('o/u') || lowerMarket.includes('over/under') || lowerMarket.includes('total goals')) {
+                        actualOutcome = total > 2.5 ? 'Over 2.5' : 'Under 2.5';
+                        if(sel.pick.includes('Over') && total > 2.5) isWin = true;
+                        if(sel.pick.includes('Under') && total < 2.5) isWin = true;
+                    } else if (lowerMarket.includes('gg') || lowerMarket.includes('both teams to score')) {
+                        actualOutcome = gg ? 'GG' : 'NG';
+                        if((sel.pick === 'GG' || sel.pick === 'Yes') && gg) isWin = true;
+                        if((sel.pick === 'NG' || sel.pick === 'No') && !gg) isWin = true;
+                    } else if (lowerMarket.includes('double chance')) {
+                        actualOutcome = m.hs > m.as ? '1X/12' : (m.hs === m.as ? '1X/X2' : 'X2/12');
+                        if(sel.pick === '1X' && m.hs >= m.as) isWin = true;
+                        if(sel.pick === '12' && m.hs !== m.as) isWin = true;
+                        if(sel.pick === 'X2' && m.hs <= m.as) isWin = true;
+                    }
+                    
+                    sel.outcome = actualOutcome;
+                    sel.status = isWin ? 'Won' : 'Lost';
+
+                    if (!isWin) hasLost = true;
+
+                } else {
+                    // Match wasn't found in this round, check if it timed out globally
+                    if (now - new Date(bet.createdAt).getTime() > 5 * 60 * 1000) {
+                        sel.status = 'Cashed Out'; // Timeout essentially refunds the bet
+                    } else {
+                        allFinished = false; // Still waiting for a different round
+                    }
                 }
-                
-                bet.status = isWin ? 'Won' : 'Lost';
+            }
+
+            bet.selections = updatedSelections;
+            bet.markModified('selections');
+
+            let rawPhone = bet.userPhone.replace(/\D/g, '');
+            let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
+            let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
+
+            const user = await User.findOne({ $or: [{ phone: rawPhone }, { phone: phone0 }, { phone: phone254 }] });
+
+            if (hasLost) {
+                bet.status = 'Lost';
                 await bet.save(); 
-                
-                let rawPhone = bet.userPhone.replace(/\D/g, '');
-                let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
-                let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
-
-                const user = await User.findOne({ $or: [{ phone: rawPhone }, { phone: phone0 }, { phone: phone254 }] });
-
-                if(isWin) {
+                if(user) {
+                    sendPushNotification(user.phone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
+                }
+            } else if (allFinished) {
+                // Check if all legs are 'Cashed Out' (Timed out)
+                if (updatedSelections.every(s => s.status === 'Cashed Out')) {
+                    bet.status = 'Cashed Out';
+                    await bet.save();
+                    if(user) {
+                        user.balance += bet.stake;
+                        await user.save();
+                        await Transaction.create({ refId: `REF-${bet.ticketId}`, userPhone: user.phone, type: 'refund', method: 'Virtuals Timeout Refund', amount: bet.stake });
+                    }
+                } else {
+                    // It's a clean Win
+                    bet.status = 'Won';
+                    await bet.save(); 
                     if(user) {
                         user.balance += bet.potentialWin;
                         await user.save();
                         await Transaction.create({ refId: `V-WIN-${bet.ticketId}`, userPhone: user.phone, type: 'win', method: 'Virtual Winnings', amount: bet.potentialWin });
                         sendPushNotification(user.phone, "Virtual Bet Won! 🥳", `Ticket ${bet.ticketId} won KES ${bet.potentialWin}!`, "win");
-                    }
-                } else {
-                    if(user) {
-                        sendPushNotification(user.phone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
-                    }
-                }
-            } else {
-                if (now - new Date(bet.createdAt).getTime() > 5 * 60 * 1000) {
-                    bet.status = 'Cashed Out'; 
-                    await bet.save();
-                    
-                    let rawPhone = bet.userPhone.replace(/\D/g, '');
-                    let phone0 = rawPhone.startsWith('254') ? '0' + rawPhone.substring(3) : rawPhone;
-                    let phone254 = rawPhone.startsWith('0') ? '254' + rawPhone.substring(1) : rawPhone;
-                    const user = await User.findOne({ $or: [{ phone: rawPhone }, { phone: phone0 }, { phone: phone254 }] });
-                    
-                    if(user) {
-                        user.balance += bet.stake;
-                        await user.save();
-                        await Transaction.create({ refId: `REF-${bet.ticketId}`, userPhone: user.phone, type: 'refund', method: 'Virtuals Timeout Refund', amount: bet.stake });
                     }
                 }
             }
