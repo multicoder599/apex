@@ -739,6 +739,96 @@ app.delete('/api/admin/fixed-games', async (req, res) => {
     } catch(e) { res.status(500).json({ success: false }); }
 });
 
+// ==========================================
+// MANUAL FORCE SETTLEMENT OVERRIDE
+// ==========================================
+app.post('/api/admin/force-settle', async (req, res) => {
+    try {
+        const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
+        const fixedGames = await FixedGame.find({});
+        let processedCount = 0;
+
+        for (let bet of openBets) {
+            let hasLost = false;
+            let allFinished = true;
+            let betModified = false;
+            let updatedSelections = [...bet.selections];
+
+            for (let i = 0; i < updatedSelections.length; i++) {
+                let sel = updatedSelections[i];
+
+                if (sel.status === 'Won') continue;
+                if (sel.status === 'Lost') { hasLost = true; break; }
+
+                let fixedMatch = fixedGames.find(fg => fg.matchName === sel.match);
+
+                // ONLY settle if a fixed match exists. We ignore the 2-hour time rule here.
+                if (fixedMatch) {
+                    betModified = true;
+                    let isWin = false;
+
+                    sel.finalScore = fixedMatch.ft_score || "Settled";
+                    sel.ftScore = sel.finalScore;
+
+                    if (sel.market === '1X2' || sel.market === 'Match Winner') {
+                        isWin = (sel.pick === fixedMatch.result_1x2);
+                        sel.outcome = fixedMatch.result_1x2;
+                    } else if (sel.market === 'O/U 2.5') {
+                        isWin = (sel.pick === fixedMatch.result_ou25);
+                        sel.outcome = fixedMatch.result_ou25;
+                    } else if (sel.market === 'GG/NG') {
+                        isWin = (sel.pick === fixedMatch.result_ggng);
+                        sel.outcome = fixedMatch.result_ggng;
+                    } else if (sel.market === 'Correct Score') {
+                        isWin = (sel.pick === fixedMatch.ft_score);
+                        sel.outcome = fixedMatch.ft_score;
+                    } else {
+                        isWin = (sel.pick === fixedMatch.result_1x2);
+                        sel.outcome = fixedMatch.result_1x2;
+                    }
+
+                    sel.status = isWin ? 'Won' : 'Lost';
+                    if (!isWin) hasLost = true;
+                } else {
+                    // If no fixed match is injected for this selection, it remains pending
+                    allFinished = false; 
+                }
+            }
+
+            if (betModified) {
+                bet.selections = updatedSelections;
+                bet.markModified('selections');
+
+                if (hasLost) {
+                    bet.status = 'Lost';
+                    await bet.save();
+                    processedCount++;
+                    sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
+                } else if (allFinished) {
+                    bet.status = 'Won';
+                    await bet.save();
+                    processedCount++;
+                    
+                    const user = await User.findOne({ phone: bet.userPhone });
+                    if (user) {
+                        user.balance += bet.potentialWin;
+                        await user.save();
+                        await Transaction.create({ 
+                            refId: `WIN-${bet.ticketId}`, userPhone: user.phone, 
+                            type: 'win', method: 'Bet Winnings', amount: bet.potentialWin 
+                        });
+                        sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
+                    }
+                }
+            }
+        }
+        res.json({ success: true, processed: processedCount });
+    } catch(e) {
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
+
 app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
