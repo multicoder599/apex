@@ -253,7 +253,7 @@ app.post('/api/deposit', async (req, res) => {
         const reference = "DEP" + Date.now();
 
         const payload = {
-            api_key: "MGPY26G5iWPw", 
+            api_key: "MGPY5V6XltyF", 
             email: "kanyingiwaitara@gmail.com", 
             amount: amount, 
             msisdn: formattedPhone,
