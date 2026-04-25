@@ -31,7 +31,7 @@ const MONGO_URI = process.env.MONGO_URI;
 const ODDS_API_KEY = process.env.ODDS_API_KEY; 
 
 // ==========================================
-// TELEGRAM BOT UTILITY (For Admin Alerts)
+// TELEGRAM BOT UTILITY
 // ==========================================
 function sendTelegramMessage(message) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
@@ -88,7 +88,8 @@ const Transaction = mongoose.model('Transaction', transactionSchema);
 const liveGameSchema = new mongoose.Schema({
     id: Number, category: String, home: String, away: String,
     odds: String, draw: String, away_odds: String, time: String,
-    status: { type: String, default: 'upcoming' }
+    status: { type: String, default: 'upcoming' },
+    commence_time: { type: Number }
 }, { strict: false }); 
 const LiveGame = mongoose.model('LiveGame', liveGameSchema);
 
@@ -119,7 +120,6 @@ const bookingSchema = new mongoose.Schema({
 });
 const Booking = mongoose.model('Booking', bookingSchema);
 
-// 🟢 ADMIN CONTROL SETTINGS SCHEMA
 const configSchema = new mongoose.Schema({
     settingId: { type: String, default: 'global', unique: true },
     aviatorWinChance: { type: Number, default: 30 },
@@ -127,7 +127,6 @@ const configSchema = new mongoose.Schema({
 });
 const SystemConfig = mongoose.model('SystemConfig', configSchema);
 
-// Load Settings into Memory for fast access
 let globalSettings = { aviatorWinChance: 30, virtualsMargin: 1.20 };
 SystemConfig.findOne({ settingId: 'global' }).then(conf => {
     if (conf) { 
@@ -179,7 +178,7 @@ async function sendPushNotification(phone, title, message, type) {
             { $or: [{ phone: phone }, { phone: formattedPhone }] },
             { $push: { notifications: notifObj } }
         );
-    } catch(e) { console.error("Notification Save Error", e); }
+    } catch(e) {}
 }
 
 // ==========================================
@@ -397,7 +396,7 @@ app.get('/api/book-bet/:code', async (req, res) => {
 
 
 // ==========================================
-// SPORTS BETTING ENDPOINTS (Added Outcome init)
+// SPORTS BETTING ENDPOINTS 
 // ==========================================
 app.post('/api/place-bet', async (req, res) => {
     try {
@@ -449,7 +448,7 @@ app.post('/api/place-bet', async (req, res) => {
             pick: s.pick || '-',
             odds: Number(s.odds) || 1.00,
             status: 'Pending',
-            outcome: 'Pending', // <-- ADDED for Detail View mapping
+            outcome: 'Pending', 
             startTime: s.startTime || Date.now(),
             matchId: s.matchId || null 
         }));
@@ -541,7 +540,7 @@ app.post('/api/cashout', async (req, res) => {
 
 
 // ==========================================
-// 🟢 FIXED: REALISTIC BACKGROUND BET SETTLEMENT (Applies correct Outcome)
+// BACKGROUND BET SETTLEMENT 
 // ==========================================
 setInterval(async () => {
     try {
@@ -567,7 +566,6 @@ setInterval(async () => {
                      startTime = new Date(bet.createdAt).getTime();
                 }
                 
-                // Exactly 2 Hours after the guaranteed correct startTime
                 let endTime = startTime + (120 * 60 * 1000); 
 
                 if (now < endTime) {
@@ -581,9 +579,8 @@ setInterval(async () => {
 
                 if (fixedMatch) {
                     sel.finalScore = fixedMatch.ft_score || "Settled"; 
-                    sel.ftScore = sel.finalScore; // Pass to detail view
+                    sel.ftScore = sel.finalScore; 
 
-                    // Validate against actual result and save the outcome
                     if (sel.market === '1X2' || sel.market === 'Match Winner') {
                         isWin = (sel.pick === fixedMatch.result_1x2);
                         sel.outcome = fixedMatch.result_1x2;
@@ -601,7 +598,6 @@ setInterval(async () => {
                         sel.outcome = fixedMatch.result_1x2;
                     }
                 } else {
-                    // Random settlement logic
                     sel.finalScore = "Settled"; 
                     sel.ftScore = sel.finalScore;
                     
@@ -623,7 +619,7 @@ setInterval(async () => {
             }
 
             bet.selections = updatedSelections;
-            bet.markModified('selections'); // Critical for saving sub-document updates
+            bet.markModified('selections'); 
 
             if (hasLost) {
                 bet.status = 'Lost';
@@ -739,9 +735,6 @@ app.delete('/api/admin/fixed-games', async (req, res) => {
     } catch(e) { res.status(500).json({ success: false }); }
 });
 
-// ==========================================
-// MANUAL FORCE SETTLEMENT OVERRIDE
-// ==========================================
 app.post('/api/admin/force-settle', async (req, res) => {
     try {
         const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
@@ -762,7 +755,6 @@ app.post('/api/admin/force-settle', async (req, res) => {
 
                 let fixedMatch = fixedGames.find(fg => fg.matchName === sel.match);
 
-                // ONLY settle if a fixed match exists. We ignore the 2-hour time rule here.
                 if (fixedMatch) {
                     betModified = true;
                     let isWin = false;
@@ -790,7 +782,6 @@ app.post('/api/admin/force-settle', async (req, res) => {
                     sel.status = isWin ? 'Won' : 'Lost';
                     if (!isWin) hasLost = true;
                 } else {
-                    // If no fixed match is injected for this selection, it remains pending
                     allFinished = false; 
                 }
             }
@@ -833,6 +824,8 @@ app.post('/api/games', async (req, res) => {
     try {
         const { games, mode } = req.body;
         if (mode === 'replace') await LiveGame.deleteMany({}); 
+        
+        // Let them just insert. We will parse commence_time properly on retrieval or DB cleanup loop.
         await LiveGame.insertMany(games); 
         res.json({ success: true, message: "Games updated in database" });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to inject games' }); }
@@ -846,50 +839,79 @@ app.delete('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// UNIFIED GAMES ENDPOINT (Strict Timezone Parsing)
+// UNIFIED GAMES ENDPOINT (Strict EAT Time Parsing & Smart UI Status)
 // ==========================================
 let cachedApiGames = [];
 let lastApiFetchTime = 0;
 const API_CACHE_DURATION = 5 * 60 * 1000;
 
+function parseGameTimeEAT(timeStr) {
+    try {
+        let d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
+        let timeMatch = timeStr.match(/(\d{1,2}):(\d{2})/);
+        if (!timeMatch) return Date.now();
+
+        let hrs = String(timeMatch[1]).padStart(2, '0');
+        let mins = String(timeMatch[2]).padStart(2, '0');
+
+        if (timeStr.toLowerCase().includes('tomorrow')) {
+            d.setDate(d.getDate() + 1);
+        } else if (!timeStr.toLowerCase().includes('today')) {
+            let datePart = timeStr.split(',')[0].trim();
+            let tempD = new Date(`${datePart} ${d.getFullYear()}`);
+            if (!isNaN(tempD.getTime())) {
+                d.setMonth(tempD.getMonth());
+                d.setDate(tempD.getDate());
+            }
+        }
+        
+        let year = d.getFullYear();
+        let month = String(d.getMonth() + 1).padStart(2, '0');
+        let date = String(d.getDate()).padStart(2, '0');
+        return new Date(`${year}-${month}-${date}T${hrs}:${mins}:00+03:00`).getTime();
+    } catch(e) {
+        return Date.now();
+    }
+}
+
 app.get('/api/games', async (req, res) => {
     try {
         const dbGamesRaw = await LiveGame.find({});
-        
+        const now = Date.now();
+
+        // Dynamically parse Database Games and assign them correct live scores/statuses for the UI
         let allGames = dbGamesRaw.map(g => {
             let match = g.toObject();
             if (!match.commence_time && match.time) {
-                try {
-                    let timeStr = match.time;
-                    if (timeStr.includes(':')) {
-                        let timeMatch = timeStr.match(/(\d{1,2}):(\d{2})/);
-                        if (timeMatch) {
-                            let d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Nairobi' }));
-                            
-                            if (timeStr.toLowerCase().includes('tomorrow')) {
-                                d.setDate(d.getDate() + 1);
-                            }
-                            
-                            let year = d.getFullYear();
-                            let month = String(d.getMonth() + 1).padStart(2, '0');
-                            let date = String(d.getDate()).padStart(2, '0');
-                            let hrs = String(timeMatch[1]).padStart(2, '0');
-                            let mins = String(timeMatch[2]).padStart(2, '0');
-                            
-                            // Explicitly force EAT (+03:00) so server UTC doesn't skew it
-                            let exactEpoch = new Date(`${year}-${month}-${date}T${hrs}:${mins}:00+03:00`).getTime();
-                            match.commence_time = exactEpoch;
-                        }
-                    }
-                } catch(e) {}
+                match.commence_time = parseGameTimeEAT(match.time);
             }
-            if (!match.commence_time) match.commence_time = Date.now();
+            if (!match.commence_time) match.commence_time = now;
             return match;
+        }).filter(match => {
+            const diffMins = Math.floor((now - match.commence_time) / 60000);
+            
+            // If it's been exactly 2 hours, drop it from the feed!
+            if (diffMins >= 120) return false; 
+
+            if (diffMins >= 0 && diffMins <= 115) {
+                match.status = "live";
+                match.min = diffMins > 45 && diffMins < 60 ? "HT" : diffMins > 90 ? "90+" : diffMins.toString() + "'";
+                
+                // Generate a realistic score relative to elapsed time and odds
+                const nH = parseFloat(match.odds) || 2.0;
+                const nA = parseFloat(match.away_odds) || 2.0;
+                const homeAdv = (1 / nH) > (1 / nA) ? 1.5 : 0.5;
+                match.hs = Math.floor((diffMins / 90) * homeAdv * Math.random() * 4);
+                match.as = Math.floor((diffMins / 90) * (2 - homeAdv) * Math.random() * 4);
+            } else {
+                match.status = "upcoming";
+                match.min = null;
+            }
+            return true;
         });
 
+        // The external API game fetcher block
         if (ODDS_API_KEY && ODDS_API_KEY !== 'undefined') {
-            const now = Date.now();
-            
             if (now - lastApiFetchTime > API_CACHE_DURATION || cachedApiGames.length === 0) {
                 try {
                     const [eplRes, ligaRes, upcomingRes] = await Promise.allSettled([
@@ -973,6 +995,42 @@ app.get('/api/games', async (req, res) => {
         res.json({ success: true, games: allGames });
     } catch (error) { res.status(500).json({ success: false, message: 'Failed to aggregate games' }); }
 });
+
+// ==========================================
+// BACKGROUND: INJECTED GAMES DATABASE CLEANUP
+// ==========================================
+setInterval(async () => {
+    try {
+        const now = Date.now();
+        const games = await LiveGame.find({});
+        for (let g of games) {
+            let cTime = g.commence_time;
+            
+            // If the game was just added and doesn't have commence_time parsed yet, parse it now
+            if (!cTime && g.time) {
+                cTime = parseGameTimeEAT(g.time);
+                g.commence_time = cTime;
+                await g.save();
+            }
+            if (!cTime) continue;
+
+            const diffMins = Math.floor((now - cTime) / 60000);
+            
+            // Delete if past 120 minutes (2 Hours)
+            if (diffMins >= 120) {
+                await LiveGame.findByIdAndDelete(g._id);
+            } 
+            // Save as live to the database for administrative clarity
+            else if (diffMins >= 0 && g.status !== 'live') {
+                g.status = 'live';
+                await g.save();
+            }
+        }
+    } catch (e) {
+        console.error("Live Game DB Cleanup Error:", e.message);
+    }
+}, 60 * 1000);
+
 
 // ==========================================
 // SERVER-SIDE VIRTUAL LEAGUE ENGINE
@@ -1140,7 +1198,6 @@ function updateVirtualStandings(r) {
     });
 }
 
-// 🟢 FIXED: VIRTUAL SETTLEMENT (Applies correct Outcome logic)
 async function processVirtualRoundSettlement(r) {
     try {
         const pendingBets = await Bet.find({ status: 'Open', type: 'Virtuals' });
@@ -1149,7 +1206,7 @@ async function processVirtualRoundSettlement(r) {
         for (let bet of pendingBets) {
             let updatedSelections = [...bet.selections];
             let hasLost = false;
-            let allFinished = true; // Assume true unless proven otherwise
+            let allFinished = true; 
 
             for (let i = 0; i < updatedSelections.length; i++) {
                 let sel = updatedSelections[i]; 
@@ -1191,11 +1248,10 @@ async function processVirtualRoundSettlement(r) {
                     if (!isWin) hasLost = true;
 
                 } else {
-                    // Match wasn't found in this round, check if it timed out globally
                     if (now - new Date(bet.createdAt).getTime() > 5 * 60 * 1000) {
-                        sel.status = 'Cashed Out'; // Timeout essentially refunds the bet
+                        sel.status = 'Cashed Out'; 
                     } else {
-                        allFinished = false; // Still waiting for a different round
+                        allFinished = false; 
                     }
                 }
             }
@@ -1216,7 +1272,6 @@ async function processVirtualRoundSettlement(r) {
                     sendPushNotification(user.phone, "Virtual Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
                 }
             } else if (allFinished) {
-                // Check if all legs are 'Cashed Out' (Timed out)
                 if (updatedSelections.every(s => s.status === 'Cashed Out')) {
                     bet.status = 'Cashed Out';
                     await bet.save();
@@ -1226,7 +1281,6 @@ async function processVirtualRoundSettlement(r) {
                         await Transaction.create({ refId: `REF-${bet.ticketId}`, userPhone: user.phone, type: 'refund', method: 'Virtuals Timeout Refund', amount: bet.stake });
                     }
                 } else {
-                    // It's a clean Win
                     bet.status = 'Won';
                     await bet.save(); 
                     if(user) {
