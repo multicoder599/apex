@@ -997,37 +997,133 @@ app.get('/api/games', async (req, res) => {
 });
 
 // ==========================================
-// BACKGROUND: INJECTED GAMES DATABASE CLEANUP
+// BACKGROUND BET SETTLEMENT (Strict Override)
 // ==========================================
 setInterval(async () => {
     try {
+        const openBets = await Bet.find({ status: 'Open', type: { $nin: ['Aviator', 'Virtuals'] } });
+        const fixedGames = await FixedGame.find({});
         const now = Date.now();
-        const games = await LiveGame.find({});
-        for (let g of games) {
-            let cTime = g.commence_time;
-            
-            // If the game was just added and doesn't have commence_time parsed yet, parse it now
-            if (!cTime && g.time) {
-                cTime = parseGameTimeEAT(g.time);
-                g.commence_time = cTime;
-                await g.save();
-            }
-            if (!cTime) continue;
 
-            const diffMins = Math.floor((now - cTime) / 60000);
-            
-            // Delete if past 120 minutes (2 Hours)
-            if (diffMins >= 120) {
-                await LiveGame.findByIdAndDelete(g._id);
-            } 
-            // Save as live to the database for administrative clarity
-            else if (diffMins >= 0 && g.status !== 'live') {
-                g.status = 'live';
-                await g.save();
+        for (let bet of openBets) {
+            let allFinished = true;
+            let hasLost = false;
+            let betModified = false;
+
+            let updatedSelections = [...bet.selections];
+
+            for (let i = 0; i < updatedSelections.length; i++) {
+                let sel = updatedSelections[i];
+
+                // Skip already settled legs
+                if (sel.status === 'Won') continue; 
+                if (sel.status === 'Lost') { hasLost = true; break; }
+
+                // Determine precise start time
+                let startTime = Number(sel.startTime) || new Date(bet.createdAt).getTime();
+                let endTime = startTime + (120 * 60 * 1000); 
+
+                let isWin = false;
+                let isSettledThisTick = false;
+
+                // 1. ALWAYS Check Admin Panel Injections FIRST (Regardless of Time)
+                let matchNameTarget = sel.match || sel.matchName || "";
+                let fixedMatch = fixedGames.find(fg => 
+                    fg.matchName === matchNameTarget || 
+                    fg.matchName === matchNameTarget.replace(' vs ', ' - ') ||
+                    fg.matchName.toLowerCase() === matchNameTarget.toLowerCase()
+                );
+
+                if (fixedMatch) {
+                    betModified = true;
+                    isSettledThisTick = true;
+                    
+                    sel.finalScore = fixedMatch.ft_score || "Settled"; 
+                    sel.ftScore = sel.finalScore; 
+
+                    let lowerMarket = (sel.market || "").toLowerCase();
+
+                    if (lowerMarket === '1x2' || lowerMarket === 'match winner') {
+                        isWin = (sel.pick === fixedMatch.result_1x2);
+                        sel.outcome = fixedMatch.result_1x2;
+                    } else if (lowerMarket === 'o/u 2.5' || lowerMarket === 'total goals') {
+                        isWin = (sel.pick === fixedMatch.result_ou25);
+                        sel.outcome = fixedMatch.result_ou25;
+                    } else if (lowerMarket === 'gg/ng' || lowerMarket === 'both teams to score') {
+                        isWin = (sel.pick === fixedMatch.result_ggng);
+                        sel.outcome = fixedMatch.result_ggng;
+                    } else if (lowerMarket === 'correct score') {
+                        isWin = (sel.pick === fixedMatch.ft_score);
+                        sel.outcome = fixedMatch.ft_score;
+                    } else {
+                        // Fallback to 1x2 if market is weird
+                        isWin = (sel.pick === fixedMatch.result_1x2);
+                        sel.outcome = fixedMatch.result_1x2;
+                    }
+
+                    sel.status = isWin ? 'Won' : 'Lost';
+                    if (!isWin) hasLost = true;
+
+                } 
+                // 2. If NO Fixed Game exists, fallback to Time-Based Random Settlement
+                else if (now >= endTime) {
+                    betModified = true;
+                    isSettledThisTick = true;
+                    
+                    sel.finalScore = "Settled"; 
+                    sel.ftScore = sel.finalScore;
+                    
+                    if (sel.market === 'Correct Score') {
+                        isWin = Math.random() < 0.05; 
+                        sel.outcome = isWin ? sel.pick : "Other";
+                    } else {
+                        isWin = Math.random() < 0.40;
+                        sel.outcome = isWin ? sel.pick : "Other";
+                    }
+
+                    sel.status = isWin ? 'Won' : 'Lost';
+                    if (!isWin) hasLost = true;
+                } 
+                // 3. Game is still running and has no fixed result injected yet
+                else {
+                    allFinished = false; 
+                }
+            }
+
+            if (betModified) {
+                bet.selections = updatedSelections;
+                bet.markModified('selections'); 
+
+                if (hasLost) {
+                    bet.status = 'Lost';
+                    await bet.save();
+                    sendPushNotification(bet.userPhone, "Bet Lost 😔", `Ticket ${bet.ticketId} lost. Better luck next time!`, "bet");
+                } else if (allFinished) {
+                    bet.status = 'Won';
+                    await bet.save();
+                    
+                    const user = await User.findOne({ phone: bet.userPhone });
+                    if (user) {
+                        user.balance += bet.potentialWin;
+                        await user.save();
+                        
+                        await Transaction.create({ 
+                            refId: `WIN-${bet.ticketId}`, userPhone: user.phone, 
+                            type: 'win', method: 'Bet Winnings', amount: bet.potentialWin 
+                        });
+                        
+                        sendPushNotification(user.phone, "Bet Won! 🥳", `Ticket ${bet.ticketId} won! KES ${bet.potentialWin} added to your balance.`, "win");
+                    }
+                }
+                // If betModified is true but neither hasLost nor allFinished is true,
+                // it simply saves the partial progress (e.g. 2 games won, 1 game still pending).
+                else {
+                     await bet.save();
+                }
             }
         }
-    } catch (e) {
-        console.error("Live Game DB Cleanup Error:", e.message);
+    } catch (error) { 
+        console.error("Realistic Settlement Error:", error.message); 
     }
 }, 60 * 1000);
 
