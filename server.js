@@ -14,9 +14,9 @@ const server = http.createServer(app);
 // CORS CONFIGURATION
 // ==========================================
 app.use(cors({
-    origin: "*", 
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    credentials: false 
+    origin: ['https://apexbet.co.ke', 'https://www.apexbet.co.ke'],
+        methods: ['GET', 'POST', 'PUT', 'DELETE'],
+        credentials: true
 }));
 
 app.use(express.json());
@@ -248,7 +248,7 @@ app.post('/api/deposit', async (req, res) => {
 
         let formattedPhone = phone254;
 
-        const APP_URL = process.env.APP_URL || 'https://apex-efwz.onrender.com';
+        const APP_URL = process.env.APP_URL || 'https://api.apexbet.co.ke';
         const reference = "DEP" + Date.now();
 
         const payload = {
